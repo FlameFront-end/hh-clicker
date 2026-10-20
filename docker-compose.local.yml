@@ -1,0 +1,18 @@
+name: hhru-clicker
+
+services:
+  singbox:
+    # Proxy sidecar is optional locally; enable it only when data/singbox/config.json exists.
+    profiles: ["proxy"]
+
+  hh-bot:
+    depends_on: !override []
+    # Keep the dashboard reachable from this Mac only.
+    ports: !override
+      - "127.0.0.1:8000:8000"
+    # No local sing-box credentials are present in the repository, so the
+    # first-run profile uses direct egress. HH_PROXY can be added later when
+    # a user-owned proxy is configured.
+    environment:
+      HH_PROXY: ""
+      HH_WS_USE_PROXY: "0"

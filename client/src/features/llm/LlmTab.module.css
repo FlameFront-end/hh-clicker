@@ -1,0 +1,21 @@
+.bar { display: flex; gap: 8px 18px; flex-wrap: wrap; align-items: center; padding: 9px 14px; border: 1px solid var(--border); border-radius: var(--r); background: var(--card); font-size: 12px; }
+.toggleBtn { height: 28px; padding: 0 14px; border-radius: var(--r-sm); border: 1px solid var(--border-hi); background: transparent; color: var(--dim); font-size: 12px; font-weight: 500; display: inline-flex; gap: 6px; align-items: center; }
+.toggleOn { color: var(--ok); border-color: rgba(76,195,138,.5); background: var(--ok-dim); }
+.feat { display: flex; gap: 18px; flex-wrap: wrap; padding: 9px 14px; border: 1px solid var(--border); border-radius: var(--r); background: var(--card); font-size: 12px; }
+.accs { display: flex; gap: 8px; flex-wrap: wrap; }
+.accBtn { display: inline-flex; gap: 6px; align-items: center; height: 26px; padding: 0 10px; border-radius: 999px; border: 1px solid var(--border); background: var(--card); color: var(--dim); font-size: 12px; }
+.accBtn.on { color: var(--text); border-color: var(--border-hi); }
+.stat { padding: 9px 14px; border: 1px solid var(--border); border-radius: var(--r); background: var(--card); min-width: 160px; }
+.stat b { font-size: 12px; }
+.counts { display: flex; gap: 12px; font-size: 12px; margin-top: 6px; }
+.details { border: 1px solid var(--border); border-radius: var(--r); background: var(--card); padding: 9px 14px; font-size: 12px; }
+.details summary { cursor: pointer; font-weight: 500; user-select: none; }
+.dbg { margin-top: 8px; max-height: 240px; overflow: auto; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); padding: 6px 8px; font: 11px var(--mono); }
+.link { display: flex; gap: 10px; padding: 5px 8px; border-radius: var(--r-sm); background: var(--card2); align-items: baseline; font-size: 12px; }
+.done { opacity: .5; }
+.done a { text-decoration: line-through; }
+.msg { white-space: pre-wrap; word-break: break-word; max-width: 360px; }
+.rowReplied td:first-child { box-shadow: inset 3px 0 var(--ok); }
+.rowDraft td:first-child { box-shadow: inset 3px 0 var(--warn); }
+.rowPending td:first-child { box-shadow: inset 3px 0 var(--bad); }
+.rowClosed { opacity: .5; }

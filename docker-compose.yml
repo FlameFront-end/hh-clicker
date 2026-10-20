@@ -1,0 +1,50 @@
+services:
+  singbox:
+    image: ghcr.io/sagernet/sing-box:latest
+    container_name: hhru-clicker_singbox
+    restart: unless-stopped
+    volumes:
+      - ./data/singbox:/etc/sing-box:ro
+    command: ["run", "-c", "/etc/sing-box/config.json"]
+
+  hh-bot:
+    build: .
+    # Не запускаем приложение от root: новые data/*.json должны принадлежать
+    # host-пользователю, иначе host backup/restore перестаёт работать.
+    user: "${HH_BOT_UID:-1000}:${HH_BOT_GID:-1000}"
+    depends_on:
+      - singbox
+    ports:
+      # LAN-доступ: bind на 0.0.0.0 — публикуем в сеть, защищено HH_BOT_API_KEY
+      # + HH_BOT_UNSAFE_EXPOSE=1 (см. env ниже).
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      HH_BOT_UNSAFE_EXPOSE: "1"
+      # Внутри контейнера слушаем 0.0.0.0: Docker DNAT направляет published-
+      # трафик на container IP, а НЕ на container loopback — bind 127.0.0.1
+      # внутри контейнера сделал бы дашборд недоступным даже с хоста.
+      HH_BOT_HOST: "0.0.0.0"
+      # Явный container opt-in (web_app.py::_resolve_host): разрешает bind
+      # 0.0.0.0 без HH_BOT_API_KEY. Безопасность обеспечивает host-side bind
+      # 127.0.0.1:8000:8000 в `ports` выше, а не bind внутри контейнера.
+      # Без этого opt-in bind наружу без ключа запрещён (RuntimeError,
+      # даже при HH_BOT_UNSAFE_EXPOSE=1).
+      HH_BOT_ALLOW_CONTAINER_BIND: "1"
+      # API-ключ обязателен для доступа к дашборду извне loopback. Для внешнего
+      # доступа также нужны: ports без 127.0.0.1 префикса и HH_BOT_UNSAFE_EXPOSE=1
+      # (0.0.0.0 уже задан выше; при заданном ключе opt-in не обязателен).
+      # HH_BOT_API_KEY: "change-me"
+      # Весь исходящий hh.ru-трафик (aiohttp-отклики и chatik-WS) уважает HH_PROXY
+      # и идёт через sing-box-sidecar (VLESS+Reality → MSK IP).
+      HH_PROXY: "socks5h://singbox:1080"
+      # Phase 1 WS realtime (websocket.hh.ru): ходим НАПРЯМУЮ, не через singbox-цепочку.
+      # "0" = direct (дефолт); "1" = WS тоже через HH_PROXY. singbox-сервис не трогаем.
+      HH_WS_USE_PROXY: "0"
+    volumes:
+      - ./data:/app/data
+      - ./server/web_app.py:/app/server/web_app.py
+      - ./server/app:/app/server/app
+      - ./client/static:/app/client/static
+    restart: unless-stopped

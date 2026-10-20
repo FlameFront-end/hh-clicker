@@ -1,0 +1,93 @@
+# Данные пользователя
+/data/
+/backups/
+.env
+.env.local
+.env.*
+!.env.example
+
+# Экспорты аккаунтов / авторизации (в любом подкаталоге)
+**/accounts.json
+**/browser_sessions.json
+**/oauth_tokens.json
+**/cookies.json
+**/*cookies*.json
+**/*session-export*.json
+**/*account-export*.json
+
+# Python
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Client dependencies, builds and test reports
+node_modules/
+.vite/
+*.tsbuildinfo
+coverage/
+playwright-report/
+test-results/
+*.local
+
+# Private keys, certificates and local secret files
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.key
+*.pem
+*.p12
+*.pfx
+secrets/
+credentials/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Логи
+*.log
+
+# Local tooling
+react-b*.tgz
+*.bak
+.openclaw/
+AGENTS.md
+SOUL.md
+TOOLS.md
+IDENTITY.md
+USER.md
+HEARTBEAT.md
+apks/fonts-noto-color-emoji_2.047-0ubuntu0.22.04.1_all.deb
+probe_*.py
+fonts-noto-color-emoji_*.deb
+apks/
+*.apk
+*.aab
+audit/
+audits/
+audit-*/
+decomp*/
+jadx*/

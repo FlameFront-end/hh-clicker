@@ -1,0 +1,7 @@
+.overlay { position: fixed; inset: 0; background: rgba(0,0,0,.7); display: grid; place-items: center; z-index: 100; backdrop-filter: blur(4px); }
+.box { width: 380px; background: var(--card); border: 1px solid var(--border-hi); border-radius: 12px; padding: 22px; display: flex; flex-direction: column; gap: 12px; }
+.box h2 { margin: 0; font-size: 16px; }
+.box p { margin: 0; color: var(--dim); font-size: 12px; }
+.box input { height: 34px; padding: 0 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); outline: none; }
+.box input:focus { border-color: var(--accent); }
+.box button { height: 34px; border-radius: var(--r-sm); border: 0; background: var(--accent); color: #0b0b12; font-weight: 600; }

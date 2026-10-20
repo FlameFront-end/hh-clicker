@@ -1,0 +1,7 @@
+.icon { flex: 0 0 auto; display: inline-block; vertical-align: -0.2em; }
+.dot { vertical-align: 0; }
+.ok { color: var(--ok); }
+.bad { color: var(--bad); }
+.warn { color: var(--warn); }
+.accent { color: var(--accent); }
+.mute { color: var(--faint); }
