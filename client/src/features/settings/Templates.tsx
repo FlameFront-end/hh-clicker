@@ -1,9 +1,11 @@
+import presetsJson from './questionnairePresets.json';
+import { confirmDialog } from '@/ui/dialog';
 import { useEffect, useState } from 'react';
 import { Icon } from '@/components/Icon';
 import { useApp, useT } from '@/store/app';
 import s from '@/ui/Ui.module.css';
 import m from './Settings.module.css';
-import { Hint, Sect, useFlash } from './kit';
+import { Actions, Field, Hint, Sect, useFlash } from './kit';
 
 interface Letter { name: string; text: string }
 interface Q { keywords: string[]; answer: string }
@@ -34,14 +36,16 @@ export function Letters() {
           <button className={`${s.btn} ${s.btnDanger} ${s.btnSm}`} onClick={() => update((a) => a.filter((_, n) => n !== i))}><Icon name="x" size={12} /></button>
         </div>
       ))}
-      <div className={m.inline}>
+      <Actions status={flash} tone="ok">
         <button className={s.btn} onClick={() => update((a) => [...a, { name: '', text: '' }])}><Icon name="plus" size={13} />{t('btn_add_template').replace('＋ ', '')}</button>
-        <button className={s.btn} onClick={() => { send({ type: 'set_letter_templates', templates: list.map((x) => ({ name: x.name.trim(), text: x.text.trim() })).filter((x) => x.name || x.text) }); clean(); setFlash('Сохранено'); }}>{t('btn_save_templates')}</button>
-        <span className={`${m.status} ${s.ok}`}>{flash}</span>
-      </div>
+        <button className={`${s.btn} ${s.btnOn}`} onClick={() => { send({ type: 'set_letter_templates', templates: list.map((x) => ({ name: x.name.trim(), text: x.text.trim() })).filter((x) => x.name || x.text) }); clean(); setFlash('Сохранено'); }}>{t('btn_save_templates')}</button>
+      </Actions>
     </Sect>
   );
 }
+
+const presets = presetsJson as Record<string, { default: string; templates: { keywords: string[]; answer: string }[] }>;
+const PRESETS: [string, string][] = [['universal', 'Универсальный'], ['sales', 'Продажи / КЦ'], ['office', 'Офис / Администратор'], ['remote', 'Удалёнка / IT']];
 
 export function Questionnaire() {
   const t = useT();
@@ -53,27 +57,42 @@ export function Questionnaire() {
   return (
     <Sect icon="clipboard-list" title={t('sec_questionnaire')}>
       <Hint>{t('sec_questionnaire_desc')}</Hint>
+      <div className={m.box}>
+        <b>Готовые пресеты</b>
+        <div className={m.inline}>
+          {PRESETS.map(([id, label]) => (
+            <button key={id} className={s.btn} onClick={async () => {
+              if (!(await confirmDialog(`Загрузить пресет «${label}»? Текущие шаблоны будут заменены.`))) return;
+              const pr = presets[id];
+              if (!pr) return;
+              update(() => pr.templates.map((x) => ({ ...x })));
+              setDef(pr.default);
+              setFlash(`Пресет загружен (${pr.templates.length}). Отредактируйте и нажмите «Сохранить».`);
+            }}>{label}</button>
+          ))}
+        </div>
+        <Hint>Заменит текущие шаблоны. Ответы можно отредактировать до сохранения.</Hint>
+      </div>
       {list.map((q, i) => (
         <div key={i} className={m.tpl}>
           <div>
-            <input className={s.input} placeholder="Ключевые слова через запятую" value={(q.keywords ?? []).join(', ')} onChange={(e) => update((a) => a.map((x, n) => (n === i ? { ...x, keywords: e.target.value.split(',').map((k) => k.trimStart()) } : x)))} />
-            <textarea className={m.ta} rows={2} placeholder="Ответ" value={q.answer} onChange={(e) => update((a) => a.map((x, n) => (n === i ? { ...x, answer: e.target.value } : x)))} />
+            <input className={s.input} placeholder="Если в вопросе есть слова… (через запятую)" value={(q.keywords ?? []).join(', ')} onChange={(e) => update((a) => a.map((x, n) => (n === i ? { ...x, keywords: e.target.value.split(',').map((k) => k.trimStart()) } : x)))} />
+            <textarea className={m.ta} rows={2} placeholder="…отвечаем так" value={q.answer} onChange={(e) => update((a) => a.map((x, n) => (n === i ? { ...x, answer: e.target.value } : x)))} />
           </div>
           <button className={`${s.btn} ${s.btnDanger} ${s.btnSm}`} onClick={() => update((a) => a.filter((_, n) => n !== i))}><Icon name="x" size={12} /></button>
         </div>
       ))}
-      <label><span className={s.dim}>{t('q_default_label')}</span>
+      <Field label={t('q_default_label')}>
         <textarea className={m.ta} rows={2} value={def ?? String(cfg?.questionnaire_default_answer ?? '')} onChange={(e) => setDef(e.target.value)} />
-      </label>
-      <div className={m.inline}>
+      </Field>
+      <Actions status={flash} tone="ok">
         <button className={s.btn} onClick={() => update((a) => [...a, { keywords: [], answer: '' }])}><Icon name="plus" size={13} />{t('btn_add_template').replace('＋ ', '')}</button>
-        <button className={s.btn} onClick={() => {
+        <button className={`${s.btn} ${s.btnOn}`} onClick={() => {
           const templates = list.map((q) => ({ keywords: (q.keywords ?? []).map((k) => k.trim()).filter(Boolean), answer: q.answer })).filter((q) => q.keywords.length || q.answer);
           send({ type: 'set_questionnaire', templates, default_answer: def ?? String(cfg?.questionnaire_default_answer ?? '') });
           clean(); setDef(null); setFlash(`Сохранено ${templates.length} шаблонов`);
         }}>{t('btn_save_templates')}</button>
-        <span className={`${m.status} ${s.ok}`}>{flash}</span>
-      </div>
+      </Actions>
     </Sect>
   );
 }

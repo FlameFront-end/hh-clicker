@@ -106,10 +106,13 @@ export function Audit({ idx }: { idx: string }) {
   const [extra, setExtra] = useState('');
   const l = useLoader(() => get<Json>(`/api/account/${idx}/resume_audit`, { extra_terms: extra.trim() }));
   return (
-    <Section icon="search" title="Аудит резюме" tone={s.accent}
+    <Section icon="search" title="Аудит резюме" desc="Проверка заполненности, конкуренции на рынке и советы, что исправить" tone={s.accent}
       actions={<button className={s.btn} disabled={l.busy || !idx} onClick={l.run}>Проверить</button>}
       status={l.busy ? 'Анализирую…' : <Err text={l.err} />}>
-      <input className={s.input} style={{ maxWidth: 600 }} placeholder="Доп. запросы для сравнения конкуренции (через запятую): devops, python developer, SRE" value={extra} onChange={(e) => setExtra(e.target.value)} />
+      <label style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <span style={{ fontSize: 12.5, fontWeight: 500 }}>Сравнить с другими запросами <span className={s.dim} style={{ fontWeight: 400 }}>— необязательно</span></span>
+        <input className={s.input} value={extra} onChange={(e) => setExtra(e.target.value)} placeholder="devops, python developer, SRE — через запятую" />
+      </label>
       {l.data && <Result d={l.data} />}
     </Section>
   );

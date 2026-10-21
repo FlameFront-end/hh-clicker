@@ -1,0 +1,29 @@
+name: Ошибка
+description: Сообщить о воспроизводимой проблеме
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Не прикладывайте API-ключи, cookies, токены, базу данных, JSON-бэкапы
+        и необработанные логи. Удалите личные данные из скриншотов.
+        Об уязвимостях сообщайте через Security → Report a vulnerability.
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Как воспроизвести
+      description: Шаги, ожидаемый и фактический результат
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Окружение
+      description: Версия или commit, ОС, браузер, Docker или локальный запуск
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Дополнительные сведения
+      description: Только обезличенные сообщения об ошибке или скриншоты

@@ -1,8 +1,11 @@
 import { useState } from 'react';
+import { Select } from '@/ui/radix';
+import { alertDialog, confirmDialog, promptDialog } from '@/ui/dialog';
 import { get, post } from '@/lib/api';
 import { safeHref } from '@/lib/safe';
 import s from '@/ui/Ui.module.css';
 import { Err, Item, Section, useLoader, type Json } from './bits';
+import v from './Views.module.css';
 
 const STATUS: Record<string, [string, string]> = {
   published: [s.ok, 'опубликовано'], auto_approved: [s.ok, 'опубликовано'], not_finished: [s.bad, 'не завершено'], modified: [s.warn, 'изменено'], blocked: [s.bad, 'заблокировано'],
@@ -13,7 +16,7 @@ const PRESETS: [string, string][] = [
 ];
 
 export function Resumes({ idx }: { idx: string }) {
-  const l = useLoader(() => get<Json>(`/api/account/${idx}/all_resumes`));
+  const l = useLoader(() => get<Json>(`/api/account/${idx}/all_resumes`), idx || undefined);
   const [preset, setPreset] = useState('');
   const [custom, setCustom] = useState('');
   const [st, setSt] = useState<{ t: string; c: string }>({ t: '', c: s.dim });
@@ -22,7 +25,7 @@ export function Resumes({ idx }: { idx: string }) {
 
   const clone = async () => {
     const title = custom.trim() || preset;
-    if (!title && !confirm('Клонировать без заголовка? Придётся задать вручную на hh.ru')) return;
+    if (!title && !(await confirmDialog('Клонировать без заголовка? Придётся задать вручную на hh.ru'))) return;
     setBusy(true); setSt({ t: 'Клонирую…', c: s.dim });
     try {
       const d = await post<Json>(`/api/account/${idx}/clone_resume`, { title });
@@ -31,29 +34,30 @@ export function Resumes({ idx }: { idx: string }) {
     } catch (e) { setSt({ t: String(e), c: s.bad }); } finally { setBusy(false); }
   };
   const quickEdit = async (hash: string) => {
-    const title = prompt('Заголовок резюме (должность):', ''); if (title === null) return;
-    const salary = prompt('Зарплата (₽, 0 = убрать):', '0');
-    const about = prompt('О себе (описание, пусто = не менять):', '');
+    const title = await promptDialog('Заголовок резюме (должность):'); if (title === null) return;
+    const salary = await promptDialog('Зарплата (₽, 0 = убрать):', '0');
+    const about = await promptDialog('О себе (описание, пусто = не менять):');
     const body: Json = { resume_hash: hash };
     if (title) body.title = title;
     if (salary && parseInt(salary) > 0) body.salary = parseInt(salary);
     if (about) body.skills = about;
-    if (Object.keys(body).length < 2) return alert('Нечего менять');
+    if (Object.keys(body).length < 2) return void alertDialog('Нечего менять');
     try {
       const d = await post<Json>(`/api/account/${idx}/edit_resume`, body);
-      if (d.ok) { alert('Резюме обновлено'); void l.run(); } else alert(d.error || 'Ошибка');
-    } catch (e) { alert(String(e)); }
+      if (d.ok) { void alertDialog('Резюме обновлено'); void l.run(); } else void alertDialog(d.error || 'Ошибка');
+    } catch (e) { void alertDialog(String(e)); }
   };
 
   return (
-    <Section icon="file-text" title="Резюме аккаунта"
-      actions={<button className={s.btn} disabled={l.busy || !idx} onClick={l.run}>Загрузить</button>}
+    <Section icon="file-text" title="Резюме аккаунта" desc="Список резюме, быстрое редактирование и клонирование под другую должность"
+      actions={<button className={s.btn} disabled={l.busy || !idx} onClick={l.run}>Обновить</button>}
       status={l.busy ? '…' : l.data ? `${l.data.total ?? 0} резюме` : <Err text={l.err} />}>
+      <div className={v.h}>Клонировать под другую должность</div>
       <div className={s.filters}>
-        <select className={s.select} value={preset} onChange={(e) => setPreset(e.target.value)}>
+        <Select value={preset} onChange={(e) => setPreset(e.target.value)}>
           <option value="">— Выбери нишу —</option>
           {PRESETS.map(([n, c]) => <option key={n} value={n}>{n} (конкуренция {c})</option>)}
-        </select>
+        </Select>
         <input className={s.input} style={{ maxWidth: 260 }} placeholder="или свой заголовок…" value={custom} onChange={(e) => setCustom(e.target.value)} />
         <button className={s.btn} disabled={busy || !idx} onClick={() => void clone()}>Клонировать</button>
         <span className={st.c} style={{ fontSize: 12 }}>{st.t}</span>

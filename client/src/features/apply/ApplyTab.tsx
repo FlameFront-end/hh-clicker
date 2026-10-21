@@ -1,8 +1,10 @@
 import { stripEmoji } from '@/components/Icon';
+import { Select } from '@/ui/radix';
 import { useEffect, useState } from 'react';
 import { Icon } from '@/components/Icon';
 import { post } from '@/lib/api';
 import { useApp, useT } from '@/store/app';
+import { PageHead } from '@/ui/Kit';
 import s from '@/ui/Ui.module.css';
 import styles from './ApplyTab.module.css';
 
@@ -72,42 +74,52 @@ export function ApplyTab() {
   const toggleCheck = (f: string, v: string) =>
     setAns((a) => { const c = (a[f] as string[]) ?? []; return { ...a, [f]: c.includes(v) ? c.filter((x) => x !== v) : [...c, v] }; });
 
+  const resIcon = { ok: 'check', warn: 'triangle-alert', err: 'x', info: 'circle-help' } as const;
   return (
-    <div className={styles.form}>
-      <h2 className={s.title}>{t('apply_title')}</h2>
-      <p className={s.dim} style={{ margin: 0 }}>{t('apply_desc')}</p>
+    <div className={styles.wrap}>
+      <PageHead title={t('apply_title')} sub={t('apply_desc')} />
 
-      <label className={styles.row}><span>{t('apply_label_acc')}</span>
-        <select className={s.select} value={cur ?? ''} onChange={(e) => { setAcc(Number(e.target.value)); setTouched(false); }}>
-          {accounts.map((a) => <option key={a.idx} value={a.idx}>{stripEmoji(a.name)}</option>)}
-        </select>
-      </label>
-      <label className={styles.row}><span>{t('apply_label_vacancy')}</span>
-        <input className={s.input} value={vac} onChange={(e) => setVac(e.target.value)} placeholder={t('apply_vacancy_ph')} onKeyDown={(e) => e.key === 'Enter' && void check()} />
-      </label>
-      <label className={styles.row}><span>{t('apply_label_tpl')}</span>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <select className={s.select} style={{ flex: 1 }} value="" onChange={(e) => { const a = accounts.find((x) => String(x.idx) === e.target.value); if (a) { setLetter(a.letter ?? ''); setTouched(true); } }}>
-            <option value="">{t('apply_tpl_ph')}</option>
+      <section className={styles.card}>
+        <h3 className={styles.step}><i>1</i>Куда откликаемся</h3>
+        <label className={styles.row}><span>{t('apply_label_acc')}</span>
+          <Select value={cur ?? ''} onChange={(e) => { setAcc(Number(e.target.value)); setTouched(false); }} style={{ width: '100%' }}>
             {accounts.map((a) => <option key={a.idx} value={a.idx}>{stripEmoji(a.name)}</option>)}
-          </select>
-          <button className={s.btn} onClick={() => { setLetter(''); setTouched(true); }}><Icon name="x" size={12} />{t('apply_btn_clear')}</button>
-        </div>
-      </label>
-      <label className={styles.row}><span>{t('apply_label_letter')}</span>
-        <textarea className={styles.ta} rows={5} value={letter} onChange={(e) => { setLetter(e.target.value); setTouched(true); }} placeholder={t('apply_letter_ph')} />
-      </label>
-      <div><button className={styles.primary} disabled={busy} onClick={() => void check()}><Icon name="search" size={14} />{t('apply_btn_check')}</button></div>
+          </Select>
+        </label>
+        <label className={styles.row}><span>{t('apply_label_vacancy')}</span>
+          <input className={s.input} style={{ height: 36 }} value={vac} onChange={(e) => setVac(e.target.value)} placeholder={t('apply_vacancy_ph')} onKeyDown={(e) => e.key === 'Enter' && void check()} />
+        </label>
+      </section>
 
-      {msg && <div className={`${styles.result} ${styles[msg.kind]}`}>{msg.text}</div>}
+      <section className={styles.card}>
+        <h3 className={styles.step}><i>2</i>Сопроводительное письмо</h3>
+        <div className={styles.row}><span>{t('apply_label_tpl')}</span>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <Select style={{ flex: 1 }} value="" onChange={(e) => { const a = accounts.find((x) => String(x.idx) === e.target.value); if (a) { setLetter(a.letter ?? ''); setTouched(true); } }}>
+              <option value="">{t('apply_tpl_ph')}</option>
+              {accounts.map((a) => <option key={a.idx} value={a.idx}>{stripEmoji(a.name)}</option>)}
+            </Select>
+            <button className={s.btn} style={{ height: 30 }} onClick={() => { setLetter(''); setTouched(true); }}><Icon name="x" size={12} />{t('apply_btn_clear')}</button>
+          </div>
+        </div>
+        <label className={styles.row}><span>{t('apply_label_letter')}</span>
+          <textarea className={styles.ta} rows={5} value={letter} onChange={(e) => { setLetter(e.target.value); setTouched(true); }} placeholder={t('apply_letter_ph')} />
+        </label>
+      </section>
+
+      <div className={styles.actions}>
+        <button className={styles.primary} disabled={busy} onClick={() => void check()}><Icon name="search" size={14} />{t('apply_btn_check')}</button>
+      </div>
+
+      {msg && <div className={`${styles.result} ${styles[msg.kind]}`}><Icon name={resIcon[msg.kind]} size={14} /><span>{msg.text}</span></div>}
 
       {qs && (
-        <div className={styles.qs}>
-          <h3 className={styles.qh}>Опросник — {qs.length} вопросов</h3>
+        <section className={styles.card}>
+          <h3 className={styles.step}><i>3</i>Опросник работодателя <small>{qs.length} {qs.length === 1 ? 'вопрос' : 'вопросов'}</small></h3>
           {qs.map((q, i) => (
             <div key={q.field} className={styles.q}>
-              <div className={s.dim} style={{ fontSize: 11 }}>Вопрос {i + 1} из {qs.length}</div>
-              <div style={{ margin: '2px 0 8px', fontWeight: 500 }}>{q.text}</div>
+              <div className={styles.qn}>Вопрос {i + 1} из {qs.length}</div>
+              <div className={styles.qt}>{q.text}</div>
               {q.type === 'radio' && q.options?.map((o) => (
                 <label key={o.value} className={styles.opt}><input type="radio" name={`aq_${q.field}`} checked={ans[q.field] === o.value} onChange={() => setAns((a) => ({ ...a, [q.field]: o.value }))} />{o.label}</label>
               ))}
@@ -115,18 +127,18 @@ export function ApplyTab() {
                 <label key={o.value} className={styles.opt}><input type="checkbox" checked={((ans[q.field] as string[]) ?? []).includes(o.value)} onChange={() => toggleCheck(q.field, o.value)} />{o.label}</label>
               ))}
               {q.type === 'select' && (
-                <select className={s.select} value={(ans[q.field] as string) ?? ''} onChange={(e) => setAns((a) => ({ ...a, [q.field]: e.target.value }))}>
+                <Select value={(ans[q.field] as string) ?? ''} onChange={(e) => setAns((a) => ({ ...a, [q.field]: e.target.value }))}>
                   {q.options?.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-                </select>
+                </Select>
               )}
               {q.type === 'textarea' && <textarea className={styles.ta} rows={3} value={(ans[q.field] as string) ?? ''} onChange={(e) => setAns((a) => ({ ...a, [q.field]: e.target.value }))} />}
             </div>
           ))}
-          <div style={{ display: 'flex', gap: 8 }}>
+          <div className={styles.actions}>
             <button className={styles.primary} disabled={busy} onClick={() => void submit()}><Icon name="rocket" size={14} />Откликнуться</button>
-            <button className={s.btn} onClick={() => { setQs(null); setMsg(null); }}>Отмена</button>
+            <button className={s.btn} style={{ height: 36 }} onClick={() => { setQs(null); setMsg(null); }}>Отмена</button>
           </div>
-        </div>
+        </section>
       )}
     </div>
   );

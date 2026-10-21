@@ -46,19 +46,6 @@ def test_raw_account_delete_prunes_runtime_snapshot(monkeypatch):
         bot.account_states[:] = old_states
 
 
-def test_frontend_reindexes_and_resyncs_account_controls():
-    source = open("client/static/js/app.js", encoding="utf-8").read()
-    assert "removeAccountFromCurrentSnapshot(idx)" in source
-    assert "Number(a.idx) - 1" in source
-    assert "JobStatusSyncAccounts" in source
-    assert "delete _AccDiagCache[idx]" in source
-
-    job_status = open("client/static/js/features/job_status.js", encoding="utf-8").read()
-    assert "window.JobStatusSyncAccounts = jsFillAccounts" in job_status
-    hedi = open("client/static/js/features/hedi.js", encoding="utf-8").read()
-    assert "HediState.idx = null" in hedi
-
-
 def test_safety_toggle_is_per_account_and_persisted(monkeypatch):
     old_accounts = list(accounts_data)
     old_states = list(bot.account_states)

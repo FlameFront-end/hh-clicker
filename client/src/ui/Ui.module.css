@@ -1,4 +1,4 @@
-.page { display: flex; flex-direction: column; gap: 12px; }
+.page { display: flex; flex-direction: column; gap: 16px; }
 .head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .title { font-size: 15px; font-weight: 600; margin: 0; }
 .count { color: var(--dim); font-weight: 400; }
@@ -13,14 +13,17 @@
 .btnDanger { color: var(--bad); }
 .btnDanger:hover:not(:disabled) { background: var(--bad-dim); border-color: rgba(239,106,106,.5); }
 .btnSm { height: 24px; padding: 0 8px; font-size: 11px; }
-.tableWrap { border: 1px solid var(--border); border-radius: var(--r); background: var(--card); overflow: auto; }
-.table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-.table th { position: sticky; top: 0; background: var(--card); text-align: left; font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); padding: 9px 12px; border-bottom: 1px solid var(--border); white-space: nowrap; user-select: none; }
+.tableWrap { border: 1px solid var(--border); border-radius: 12px; background: var(--card); overflow: auto; }
+.table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.table th { position: sticky; top: 0; z-index: 1; background: var(--card2); text-align: left; font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); padding: 10px 16px; border-bottom: 1px solid var(--border); white-space: nowrap; user-select: none; }
 .table th.sortable { cursor: pointer; }
 .table th.sortable:hover { color: var(--text); }
-.table td { padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.table td { padding: 11px 16px; border-bottom: 1px solid var(--border); vertical-align: middle; }
 .table tr:last-child td { border-bottom: 0; }
-.table tbody tr:hover { background: #111115; }
+.table tbody tr { transition: background .1s; }
+.table tbody tr:hover { background: var(--card2); }
+.table a { color: inherit; text-decoration: none; }
+.mono { font-size: 12.5px; font-variant-numeric: tabular-nums; }
 .nowrap { white-space: nowrap; }
 .dim { color: var(--dim); }
 .ok { color: var(--ok); }
@@ -32,3 +35,4 @@
 .state { padding: 32px; text-align: center; color: var(--dim); }
 .checkLbl { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; color: var(--dim); cursor: pointer; }
 .checkLbl input { accent-color: var(--accent); }
+.btnOn { border-color: var(--accent); color: var(--accent); background: var(--accent-dim, rgba(139,147,255,.12)); }

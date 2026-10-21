@@ -23,7 +23,6 @@ export function Header() {
   const totalDaily = accs.reduce((s, a) => s + num(a.daily_sent), 0);
   const limit = num(cfg?.daily_apply_limit);
   const stopped = accs.some((a) => a.hard_stopped);
-  const protectedCount = accs.filter((a) => a.safety_enabled).length;
   const pausedAccs = accs.filter((a) => a.paused).length;
   const oauthCount = accs.filter((a) => a.use_oauth).length;
   const globalOAuth = !!cfg?.use_oauth_apply;
@@ -31,45 +30,32 @@ export function Header() {
 
   const views = accs.reduce((s, a) => s + num(a.resume_views_new), 0);
   const inv = accs.reduce((s, a) => s + num(a.resume_invitations_new), 0);
+  const viewsNew = Math.max(views, num(counters?.new_resume_views));
+  const inboxChats = num(counters?.unread_chats);
+  const inboxNeg = num(counters?.unread_negotiations);
 
   return (
     <header className={styles.header}>
-      <span className={`${styles.conn} ${connected ? styles.on : ''}`} title={connected ? 'WebSocket: подключён' : 'WebSocket: нет связи'} />
+      <span className={`${styles.conn} ${connected ? styles.on : ''}`} title={`${connected ? 'Подключено' : 'Нет связи'} · работает ${fmtUptime(snap?.uptime_seconds ?? 0)}`} />
       <h1 className={styles.title}>HH Bot</h1>
 
       <div className={styles.stats}>
-        <span title={t('hdr_found')}><Icon name="search" size={13} /> <b className="tnum">{gs?.total_found ?? 0}</b> {t('hdr_found')}</span>
         <span title={t('hdr_replies')}><Icon name="check" size={13} tone="ok" /> <b className="tnum">{gs?.total_sent ?? 0}</b> {t('hdr_replies')}
-          {limit > 0 && <em className={totalDaily >= limit ? styles.bad : styles.warn}> {totalDaily}/{limit} сегодня</em>}
-          {limit <= 0 && totalDaily > 0 && <em className={stopped ? styles.bad : styles.warn}> {totalDaily} сегодня</em>}
+          {limit > 0 && <em className={totalDaily >= limit ? styles.bad : styles.dim}> · сегодня {totalDaily}/{limit}</em>}
+          {limit <= 0 && totalDaily > 0 && <em className={stopped ? styles.bad : styles.dim}> · сегодня {totalDaily}</em>}
         </span>
-        <span><Icon name="database" size={13} /> <b className="tnum">{gs?.storage_total ?? 0}</b> {t('hdr_in_db')}</span>
-        <span><Icon name="flask-conical" size={13} /> <b className="tnum">{gs?.storage_tests ?? 0}</b> {t('hdr_tests')}</span>
-        {cfg?.filter_agencies && <span className={styles.tag}>Без агентств</span>}
-        {cfg?.filter_low_competition && <span className={styles.tag}>&lt;10 откликов</span>}
-        {num(cfg?.search_period_days) > 0 && <span className={styles.tag}>{num(cfg?.search_period_days)} д</span>}
-        {protectedCount > 0 && <span className={styles.tag}><Icon name="shield" size={11} /> {protectedCount}/{accs.length}</span>}
+        <span title={`${t('hdr_in_db')} · с тестом: ${gs?.storage_tests ?? 0}`}><Icon name="database" size={13} /> <b className="tnum">{gs?.storage_total ?? 0}</b> {t('hdr_in_db')}</span>
       </div>
 
-      {(views > 0 || inv > 0) && (
-        <div className={styles.stats}>
-          <span><Icon name="eye" size={13} /> <b className="tnum">{views}</b> {t('hdr_new_views')}</span>
-          <span><Icon name="mailbox" size={13} tone="ok" /> <b className="tnum">{inv}</b> {t('hdr_new_inv')}</span>
-        </div>
-      )}
-
-      {counters && (counters.unread_chats + counters.unread_negotiations + counters.new_resume_views + counters.new_notifications > 0) && (
-        <div className={styles.stats} title="Счётчики HH по всем аккаунтам">
-          <span title="непрочитанные чаты"><Icon name="message-square" size={13} /> <b className="tnum">{counters.unread_chats}</b></span>
-          <span title="непрочитанные переговоры"><Icon name="mailbox" size={13} /> <b className="tnum">{counters.unread_negotiations}</b></span>
-          <span title="новые просмотры резюме"><Icon name="eye" size={13} /> <b className="tnum">{counters.new_resume_views}</b></span>
-          <span title="новые уведомления"><Icon name="bell" size={13} /> <b className="tnum">{counters.new_notifications}</b></span>
+      {(inboxChats + inboxNeg + viewsNew + inv > 0) && (
+        <div className={`${styles.stats} ${styles.hh}`} title="Новое на HH по всем аккаунтам">
+          {inboxChats > 0 && <span title="Непрочитанные чаты"><Icon name="message-square" size={13} /> <b className="tnum">{inboxChats}</b></span>}
+          {(inboxNeg + inv) > 0 && <span title="Новые приглашения и отклики работодателей"><Icon name="mailbox" size={13} tone="ok" /> <b className="tnum">{Math.max(inboxNeg, inv)}</b></span>}
+          {viewsNew > 0 && <span title="Новые просмотры резюме"><Icon name="eye" size={13} /> <b className="tnum">{viewsNew}</b></span>}
         </div>
       )}
 
       <span className={styles.spacer} />
-
-      <span className={styles.uptime}><Icon name="timer" size={13} /> {fmtUptime(snap?.uptime_seconds ?? 0)}</span>
 
       {reviews.total > 0 && (
         <span className={styles.reviewsWrap}>

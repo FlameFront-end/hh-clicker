@@ -20,7 +20,6 @@ RUN pip install --no-cache-dir -r server/requirements.txt
 COPY server/web_app.py server/web_app.py
 COPY server/app/ server/app/
 COPY server/scripts/ server/scripts/
-COPY client/static/ client/static/
 COPY --from=client-build /build/client/static/dist client/static/dist/
 ENV PYTHONPATH=/app/server
 

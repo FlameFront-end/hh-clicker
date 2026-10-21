@@ -5,31 +5,53 @@ import { num } from '@/lib/format';
 export type Tone = 'idle' | 'run' | 'bad' | 'warn';
 export interface StatusView { label: string; tone: Tone; icon: IconName; title?: string }
 
-const MAP: Record<string, [IconName, string, Tone]> = {
-  idle: ['pause', 'status_idle', 'idle'],
-  collecting: ['inbox', 'status_collecting', 'run'],
-  applying: ['send', 'status_applying', 'run'],
-  limit: ['ban', 'status_limit', 'bad'],
-  waiting: ['hourglass', 'status_waiting', 'warn'],
-  checking: ['search', 'status_checking', 'run'],
-  '—': ['circle', 'status_inactive', 'idle'],
+/** Человеческие подписи статусов (sentence case) + пояснение в подсказке. */
+const MAP: Record<string, [IconName, string, Tone, string]> = {
+  idle: ['pause', 'Ждёт запуска', 'idle', 'Бот ещё не начал цикл для этого аккаунта'],
+  collecting: ['search', 'Ищет вакансии', 'run', 'Проходит по URL поиска и собирает подходящие вакансии'],
+  applying: ['send', 'Откликается', 'run', 'Отправляет отклики на собранные вакансии'],
+  limit: ['ban', 'Упёрся в лимит', 'bad', 'HH ограничил отклики — бот подождёт сброса'],
+  waiting: ['hourglass', 'Перерыв между циклами', 'idle', 'Круг закончен, бот ждёт и начнёт новый поиск сам'],
+  checking: ['search', 'Проверяет лимит', 'run', 'Проверяет, снял ли HH ограничение'],
+  '—': ['circle', 'Не активен', 'idle', ''],
 };
 
-export function statusOf(acc: Account, snap: Snapshot, t: (k: string) => string): StatusView {
-  if (snap.paused) return { label: t('status_all_paused'), tone: 'idle', icon: 'pause' };
+export function statusOf(acc: Account, snap: Snapshot, _t?: (k: string) => string): StatusView {
+  if (snap.paused) return { label: 'Всё на паузе', tone: 'idle', icon: 'pause', title: 'Включена общая пауза (кнопка вверху справа)' };
   if (acc.paused) {
     const hhUsed = num(acc.hh_today_applies);
     const hhLimit = num(acc.hh_daily_limit) || 200;
     if (acc.hard_stopped && hhUsed >= hhLimit)
-      return { label: `HH-лимит ${hhUsed}/${hhLimit}`, tone: 'bad', icon: 'octagon-x', title: `Счётчик из HH (обновлено ${acc.hh_today_applies_updated || '—'})` };
+      return { label: `Лимит HH: ${hhUsed} из ${hhLimit}`, tone: 'bad', icon: 'octagon-x', title: `Сбросится в 00:00 МСК · счётчик обновлён ${acc.hh_today_applies_updated || '—'}` };
     if (acc.hard_stopped && acc.daily_limit > 0 && acc.daily_sent >= acc.daily_limit)
-      return { label: `${t('status_daily_limit')} ${acc.daily_sent}/${acc.daily_limit}`, tone: 'bad', icon: 'octagon-x', title: t('status_daily_limit_hint') };
+      return { label: `Дневной лимит: ${acc.daily_sent} из ${acc.daily_limit}`, tone: 'bad', icon: 'octagon-x', title: 'Ваш лимит откликов на день исчерпан. Сбросится завтра в 00:00' };
     if (acc.limit_exceeded)
-      return { label: t('status_hh_limit'), tone: 'bad', icon: 'ban', title: acc.status_detail || t('status_hh_limit_hint') };
-    return { label: t('status_acc_paused'), tone: 'idle', icon: 'pause' };
+      return { label: 'HH ограничил отклики', tone: 'bad', icon: 'ban', title: acc.status_detail || 'Бот проверит снятие лимита автоматически' };
+    return { label: 'На паузе', tone: 'idle', icon: 'pause', title: 'Включите переключатель, чтобы бот продолжил' };
   }
   const m = MAP[acc.status];
-  return { label: m ? t(m[1]) : String(acc.status).toUpperCase(), tone: m?.[2] ?? 'idle', icon: m?.[0] ?? 'circle-help', title: acc.status_detail || undefined };
+  return { label: m ? m[1] : String(acc.status), tone: m?.[2] ?? 'idle', icon: m?.[0] ?? 'circle-help', title: m?.[3] || undefined };
+}
+
+/** Понятная строка «что сейчас происходит» из технического status_detail. */
+export function humanDetail(detail: string | undefined | null): string {
+  const d = (detail || '').trim();
+  if (!d) return '';
+  let m = d.match(/^OAuth-сбор\s+(\d+)\s*\/\s*(\d+)/i);
+  if (m) return `Собрано ${m[1]} из ${m[2]} вакансий`;
+  m = d.match(/^(?:Web-)?сбор\s+(\d+)\s*\/\s*(\d+)/i);
+  if (m) return `Собрано ${m[1]} из ${m[2]} вакансий`;
+  if (/^нет новых вакансий/i.test(d)) return 'Новых вакансий нет — проверит снова в следующем круге';
+  return d;
+}
+
+/** «5 откликов», «1 отклик», «2 отклика». */
+export function plural(n: number, one: string, few: string, many: string): string {
+  const a = Math.abs(n) % 100, b = a % 10;
+  if (a > 10 && a < 20) return many;
+  if (b === 1) return one;
+  if (b >= 2 && b <= 4) return few;
+  return many;
 }
 
 export function ago(iso: string): { time: string; ago: string } | null {

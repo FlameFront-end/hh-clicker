@@ -1,5 +1,11 @@
 // Сгенерировано: соответствие эмодзи из ответов сервера → иконки Lucide.
 import {
+  ExternalLink,
+  ArrowUpRight,
+  Ellipsis,
+  PanelRightOpen,
+  ChevronRight,
+  Radio,
   Activity,
   Copy,
   Download,
@@ -104,6 +110,12 @@ import {
 } from 'lucide-react';
 
 export const ICONS = {
+  'external-link': ExternalLink,
+  'arrow-up-right': ArrowUpRight,
+  'ellipsis': Ellipsis,
+  'panel-right-open': PanelRightOpen,
+  'chevron-right': ChevronRight,
+  'radio': Radio,
   'activity': Activity,
   'copy': Copy,
   'download': Download,

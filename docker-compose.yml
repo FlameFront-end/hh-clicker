@@ -46,5 +46,4 @@ services:
       - ./data:/app/data
       - ./server/web_app.py:/app/server/web_app.py
       - ./server/app:/app/server/app
-      - ./client/static:/app/client/static
     restart: unless-stopped

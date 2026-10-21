@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { Select, Toggle } from '@/ui/radix';
 import { Icon } from '@/components/Icon';
 import type { IconName } from '@/components/icons';
 import { useApp } from '@/store/app';
@@ -7,10 +8,34 @@ import m from './Settings.module.css';
 
 export const Group = ({ children }: { children: ReactNode }) => <div className={m.group}>{children}</div>;
 
-export function Sect({ icon, title, open, children }: { icon: IconName; title: string; open?: boolean; children: ReactNode }) {
+const DESC: Record<string, string> = {
+  'Настройки бота': 'Скорость, паузы и лимиты откликов',
+  'Статус поиска работы': 'Что видят работодатели: ищете работу или рассматриваете предложения',
+  'Навыки и верификации': 'Навыки в профиле и подтверждённые проверки',
+  'Анализ резюме': 'Разбор резюме и советы по улучшению',
+  'Обновить куки аккаунтов': 'Если сессия устарела — вставьте свежие куки',
+  'Браузерные сессии': 'Добавление и проверка аккаунтов по браузерной сессии',
+  'WebSocket (realtime)': 'Живое обновление данных на странице',
+  'Фильтры и автоматизация': 'Какие вакансии пропускать и что делать автоматически',
+  'JSON и бэкап': 'Выгрузка и загрузка всех настроек',
+  'Диагностика': 'Технические проверки и состояние сервисов',
+  'LLM Авто-ответы': 'ИИ отвечает работодателям в чатах',
+  'Авторизация по телефону / email': 'Вход в аккаунт HH по одноразовому коду',
+  'Прокси': 'Через какой прокси ходить на hh.ru',
+  'Шаблоны писем': 'Сопроводительные письма для откликов',
+  'Шаблонные ответы на опросы': 'Готовые ответы на вопросы работодателей',
+  'Пул поисковых запросов': 'Ссылки поиска на hh.ru, по которым бот ищет вакансии',
+};
+
+export function Sect({ icon, title, desc, open = true, children }: { icon: IconName; title: string; desc?: string; open?: boolean; children: ReactNode }) {
+  const d = desc ?? DESC[title];
   return (
     <details className={m.sect} open={open}>
-      <summary><Icon name={icon} size={15} className={s.dim} />{title}<Icon name="chevron-down" size={15} className="chev" /></summary>
+      <summary>
+        <span className={m.ico}><Icon name={icon} size={15} /></span>
+        <span className={m.ttl}><b>{title}</b>{d && <small>{d}</small>}</span>
+        <Icon name="chevron-down" size={15} className={m.chev} />
+      </summary>
       <div className={m.body}>{children}</div>
     </details>
   );
@@ -56,9 +81,9 @@ export function CfgSelect({ k, options, number }: { k: string; options: [string,
   const v = useApp((x) => x.snapshot?.config?.[k]);
   const send = useApp((x) => x.sendCmd);
   return (
-    <select className={s.select} value={String(v ?? '')} onChange={(e) => send({ type: 'set_config', key: k, value: number ? parseInt(e.target.value, 10) : e.target.value })}>
+    <Select value={String(v ?? '')} onChange={(e) => send({ type: 'set_config', key: k, value: number ? parseInt(e.target.value, 10) : e.target.value })}>
       {options.map(([val, l]) => <option key={val} value={val}>{l}</option>)}
-    </select>
+    </Select>
   );
 }
 
@@ -88,3 +113,69 @@ export function useFlash(ms = 3000) {
   useEffect(() => () => window.clearTimeout(timer.current), []);
   return [t, (msg: string) => { setT(msg); window.clearTimeout(timer.current); timer.current = window.setTimeout(() => setT(''), ms); }] as const;
 }
+
+/** Блок внутри панели: заголовок + пояснение + содержимое. */
+export function Block({ title, desc, aside, children }: { title: string; desc?: ReactNode; aside?: ReactNode; children: ReactNode }) {
+  return (
+    <section className={m.block}>
+      <header className={m.blockHead}>
+        <div><h4>{title}</h4>{desc && <p>{desc}</p>}</div>
+        {aside}
+      </header>
+      {children}
+    </section>
+  );
+}
+
+/** Группа строк настроек с разделителями. */
+export const Rows = ({ children }: { children: ReactNode }) => <div className={m.rows}>{children}</div>;
+
+/** Строка настройки: слева название и пояснение, справа контрол. */
+export function Row({ title, hint, children, off }: { title: ReactNode; hint?: ReactNode; children: ReactNode; off?: boolean }) {
+  return (
+    <div className={`${m.row} ${off ? m.rowOff : ''}`}>
+      <div className={m.rowText}><span className={m.rowTitle}>{title}</span>{hint && <span className={m.rowHint}>{hint}</span>}</div>
+      <div className={m.rowCtl}>{children}</div>
+    </div>
+  );
+}
+
+/** Переключатель, привязанный к ключу конфига. */
+export function CfgSwitch({ k, title, hint, invert }: { k: string; title: ReactNode; hint?: ReactNode; invert?: boolean }) {
+  const v = useApp((x) => x.snapshot?.config?.[k]);
+  const send = useApp((x) => x.sendCmd);
+  const checked = invert ? v === false : !!v;
+  return (
+    <Row title={title} hint={hint}>
+      <Toggle checked={checked} label={typeof title === 'string' ? title : k} onChange={(on) => send({ type: 'set_config', key: k, value: invert ? !on : on })} />
+    </Row>
+  );
+}
+
+/** Поле «подпись сверху». */
+export function Field({ label, hint, tone, children }: { label: ReactNode; hint?: ReactNode; tone?: 'ok' | 'bad' | 'warn'; children: ReactNode }) {
+  return (
+    <div className={m.field}>
+      <span className={`${m.fieldLbl} ${tone ? m['t_' + tone] : ''}`}>{label}</span>
+      {children}
+      {hint && <span className={m.rowHint}>{hint}</span>}
+    </div>
+  );
+}
+
+/** Множественный выбор в виде плашек. */
+export function ChipSet({ options, value, onChange }: { options: [string, string][]; value: string[]; onChange: (v: string[]) => void }) {
+  return (
+    <div className={m.chipSet}>
+      {options.map(([id, label]) => {
+        const on = value.includes(id);
+        return <button key={id} type="button" aria-pressed={on} className={`${m.cs} ${on ? m.csOn : ''}`} onClick={() => onChange(on ? value.filter((x) => x !== id) : [...value, id])}>{on && <Icon name="check" size={12} />}{label}</button>;
+      })}
+    </div>
+  );
+}
+
+/** Ряд действий: кнопки + статус. */
+export const Actions = ({ children, status, tone }: { children: ReactNode; status?: ReactNode; tone?: 'ok' | 'bad' | 'warn' }) => (
+  <div className={m.actions}>{children}{status ? <span className={`${m.status} ${tone ? s[tone] : s.dim}`}>{status}</span> : null}</div>
+);

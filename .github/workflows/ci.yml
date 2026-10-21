@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  client:
+    name: Client build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: client
+      - run: npm run build
+        working-directory: client
+
+  server:
+    name: Server tests
+    runs-on: ubuntu-latest
+    # No Docker socket, HH credentials or private data in the test environment.
+    container: python:3.11-slim
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install -r server/requirements.txt -r server/requirements-dev.txt
+      - run: python -m pytest -c server/pytest.ini server/tests -q -o cache_dir=/tmp/pytest-cache
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --tag hh-clicker:ci .

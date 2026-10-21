@@ -1,5 +1,5 @@
 import { Emoji, Icon, stripEmoji } from '@/components/Icon';
-import { useApp, useT } from '@/store/app';
+import { useAliasOf, useApp } from '@/store/app';
 import type { RecentResponse } from '@/types/snapshot';
 import styles from './Recent.module.css';
 
@@ -14,19 +14,27 @@ function Chips({ r }: { r: RecentResponse }) {
   );
 }
 
+/** «06:02» для сегодняшних, «20 окт, 18:17» для прошлых. */
+function shortTime(raw: string): string {
+  const d = new Date(raw.replace(' ', 'T'));
+  if (Number.isNaN(d.getTime())) return raw;
+  const hm = d.toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit' });
+  return d.toDateString() === new Date().toDateString() ? hm : `${d.toLocaleDateString('ru', { day: 'numeric', month: 'short' })}, ${hm}`;
+}
+
 export function Recent() {
-  const t = useT();
   const list = useApp((s) => s.snapshot?.recent_responses) ?? [];
+  const alias = useAliasOf();
   return (
     <section className={styles.card}>
-      <h3 className={styles.title}>{t('sidebar_recent')}</h3>
+      <h3 className={styles.title}>Последние отклики</h3>
       <div className={styles.list}>
-        {list.length === 0 && <div className={styles.none}>Пока пусто</div>}
+        {list.length === 0 && <div className={styles.none}>Откликов пока не было</div>}
         {list.slice(0, 40).map((r, i) => (
           <div key={`${r.id}-${i}`} className={styles.item}>
             <div className={styles.row1}>
-              <span className={styles.time}>{r.time}</span>
-              <span className={styles.acc}>{stripEmoji(r.acc)}</span>
+              <span className={styles.time} title={r.time}>{shortTime(r.time)}</span>
+              <span className={styles.acc}>{stripEmoji(alias(r.acc))}</span>
               <span className={styles.res}><Emoji text={r.icon} size={12} /></span>
             </div>
             <div className={styles.vac} title={r.title}>{r.title}</div>

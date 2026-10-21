@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { get, post } from '@/lib/api';
 import s from '@/ui/Ui.module.css';
 import m from './Settings.module.css';
-import { Hint, Sect } from './kit';
+import { Actions, Field, Row, Rows, Sect } from './kit';
 
 interface ProxyInfo { proxy?: string; ip?: string; impersonate?: string; error?: string; ok?: boolean; reverted_to?: string }
 
@@ -39,20 +39,20 @@ export function Proxy() {
 
   return (
     <Sect icon="globe" title="Прокси">
-      <Hint>Прокси для запросов к hh.ru. Пустое поле — прямое соединение. После сохранения выполняется проверка; при ошибке прежнее значение возвращается.</Hint>
-      <div className={m.inline}>
-        <input className={s.input} style={{ flex: 1, minWidth: 220 }} placeholder="http://user:pass@host:port" value={url} onChange={(e) => setUrl(e.target.value)} />
-        <button className={s.btn} disabled={busy} onClick={() => void save()}>Сохранить</button>
+      <Field label="Адрес прокси" hint="Для запросов к hh.ru. Пусто — прямое соединение. После сохранения идёт проверка; при ошибке вернётся прежнее значение.">
+        <input className={s.input} style={{ width: '100%' }} placeholder="http://user:pass@host:port" value={url} onChange={(e) => setUrl(e.target.value)} />
+      </Field>
+      <Actions status={msg?.text} tone={msg?.bad ? 'bad' : undefined}>
+        <button className={`${s.btn} ${s.btnOn}`} disabled={busy} onClick={() => void save()}>Сохранить</button>
         <button className={s.btn} disabled={busy} onClick={() => void check()}>Проверить</button>
-      </div>
+      </Actions>
       {info && (
-        <div className={m.hint}>
-          IP: <b style={{ color: 'var(--text)' }}>{info.ip || '—'}</b>
-          {info.impersonate && <> · TLS: {info.impersonate}</>}
-          {info.proxy ? <> · прокси: {info.proxy.replace(/\/\/[^@]*@/, '//***@')}</> : <> · прямое соединение</>}
-        </div>
+        <Rows>
+          <Row title="Внешний IP"><b>{info.ip || '—'}</b></Row>
+          <Row title="Соединение">{info.proxy ? <span className={m.mono}>{info.proxy.replace(/\/\/[^@]*@/, '//***@')}</span> : <span className={s.dim}>прямое</span>}</Row>
+          {info.impersonate && <Row title="TLS-отпечаток"><span className={m.mono}>{info.impersonate}</span></Row>}
+        </Rows>
       )}
-      {msg && <div className={`${m.status} ${msg.bad ? s.bad : s.dim}`}>{msg.text}</div>}
     </Sect>
   );
 }

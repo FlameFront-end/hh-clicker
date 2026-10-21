@@ -27,6 +27,9 @@ export interface HhInterview { neg_id: string; date: string; text: string; recen
 export interface Account {
   idx: number;
   name: string;
+  /** Оригинальное имя с HH, если аккаунт переименован пользователем. */
+  hh_name?: string;
+  hh_short?: string;
   short: string;
   color: string;
   temp: boolean;

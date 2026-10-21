@@ -1,17 +1,21 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { Select, Toggle } from '@/ui/radix';
+import { confirmDialog } from '@/ui/dialog';
 import { Emoji, Icon, stripEmoji } from '@/components/Icon';
 import { get, post } from '@/lib/api';
 import { num } from '@/lib/format';
-import { colorVar, safeHref } from '@/lib/safe';
+import { safeHref } from '@/lib/safe';
 import { useApp } from '@/store/app';
 import { useAction } from '../main/useAction';
+import { AccChip, Avatar, Empty, PageHead, Pill, Search, Skeleton, Stats } from '@/ui/Kit';
 import s from '@/ui/Ui.module.css';
 import styles from './LlmTab.module.css';
 
 interface Row { neg_id?: string; acc?: string; acc_color?: string; employer?: string; vacancy_id?: string; vacancy_title?: string; employer_last_msg?: string; llm_reply?: string; status?: string; chat_status?: string; first_seen?: string; last_seen?: string }
 interface Rating { total?: number; recommend_pct?: number }
-const STATUS: Record<string, [string, string]> = { replied: ['Отправлено', s.ok], draft: ['Черновик', s.warn], pending_reply: ['Ждёт ответа', s.warn], chat_closed: ['Закрыт', s.dim] };
-const CHAT: Record<string, [string, string]> = { robot: ['Робот', s.accent], locked: ['Закрыт', s.dim], waiting_hr: ['Ждём HR', s.accent], replied: ['Ответили', s.ok] };
+type Tone = 'ok' | 'warn' | 'bad' | 'accent' | 'dim';
+const STATUS: Record<string, [string, Tone]> = { replied: ['Отправлено', 'ok'], draft: ['Черновик', 'warn'], pending_reply: ['Ждёт ответа', 'bad'], chat_closed: ['Чат закрыт', 'dim'] };
+const CHAT: Record<string, [string, Tone]> = { robot: ['Робот-рекрутер', 'accent'], locked: ['Закрыт', 'dim'], waiting_hr: ['Ждём HR', 'accent'], replied: ['Ответили', 'ok'] };
 const ts = (r: Row) => Date.parse(r.last_seen || r.first_seen || '') || 0;
 const URL_RE = /https?:\/\/[^\s<>"')]+/g;
 const kind = (u: string) => { try { const h = new URL(u).hostname; return h.replace(/^www\./, ''); } catch { return 'ссылка'; } };
@@ -50,7 +54,7 @@ export function LlmTab() {
     return `Запущено (${r.accounts ?? '?'})`;
   });
   const reset = useAction(async () => {
-    if (!confirm('Сбросить историю «уже отвечали» для всех аккаунтов?\n\nБот повторно обработает все чаты работодателей.')) return null;
+    if (!(await confirmDialog('Сбросить историю «уже отвечали» для всех аккаунтов?\n\nБот повторно обработает все чаты работодателей.', { danger: true }))) return null;
     const r = await post<{ skipped_busy?: string[] }>('/api/llm_reset_replied');
     return r.skipped_busy?.length ? `Пропущены занятые: ${r.skipped_busy.join(', ')}` : 'Сброшено';
   }, 6000);
@@ -78,8 +82,8 @@ export function LlmTab() {
     }
     return m;
   }, [rows]);
-  const fullByShort = useMemo(() => Object.fromEntries(accs.filter((a) => a.short).map((a) => [a.short, a.name])), [accs]);
-  const accFilterOpts = useMemo(() => [...new Set(rows.map((r) => r.acc).filter((a): a is string => !!a && accs.some((x) => x.short === a)))], [rows, accs]);
+  const fullByShort = useMemo(() => Object.fromEntries(accs.filter((a) => a.short).map((a) => [a.hh_short ?? a.short, a.name])), [accs]);
+  const accFilterOpts = useMemo(() => [...new Set(rows.map((r) => r.acc).filter((a): a is string => !!a && accs.some((x) => (x.hh_short ?? x.short) === a)))], [rows, accs]);
 
   // Рейтинги работодателей — лениво, только для видимой части.
   const shown = view.slice(0, 150);
@@ -114,13 +118,13 @@ export function LlmTab() {
   // Статусная строка
   const hasKey = cfg?.llm_api_key_set || (cfg?.llm_profiles ?? []).some((p) => (p as { key_set?: boolean }).key_set) || cfg?.llm_status_summary?.configured_provider === 'openclaw';
   const paused = snap?.paused || (accs.length > 0 && accs.every((a) => a.paused));
-  let state: [string, string];
-  if (!hasKey) state = ['Нет API-ключа', s.bad];
-  else if (!cfg?.llm_enabled) state = ['Тумблер LLM выключен', s.dim];
-  else if (paused) state = ['Все аккаунты на паузе', s.warn];
-  else if (!accs.some((a) => a.llm_enabled !== false)) state = ['Ни один аккаунт не включён для LLM', s.warn];
-  else if (!cfg?.llm_auto_send) state = ['Режим черновиков — включи «Автоотправку»', s.warn];
-  else state = ['Работает — авто-ответы идут', s.ok];
+  let state: [string, 'ok' | 'bad' | 'warn' | 'dim'];
+  if (!hasKey) state = ['Нет API-ключа — добавьте его в Настройки → ИИ', 'bad'];
+  else if (!cfg?.llm_enabled) state = ['ИИ-ответы выключены', 'dim'];
+  else if (paused) state = ['Все аккаунты на паузе', 'warn'];
+  else if (!accs.some((a) => a.llm_enabled !== false)) state = ['Ни один аккаунт не включён для ИИ-ответов', 'warn'];
+  else if (!cfg?.llm_auto_send) state = ['Режим черновиков — включите «Автоотправку» в настройках ИИ', 'warn'];
+  else state = ['Работает — ответы отправляются автоматически', 'ok'];
   const llmLog = (snap?.llm_log ?? []) as { time?: string; sent?: boolean; source?: string }[];
   const sent = llmLog.filter((l) => l.sent).length;
   const interviews = accs.reduce((n, a) => n + num(a.hh_interviews), 0);
@@ -129,75 +133,85 @@ export function LlmTab() {
   const src = llmLog.reduce<Record<string, number>>((m, r) => { const k = r.source || 'other'; m[k] = (m[k] || 0) + 1; return m; }, {});
 
   const feat = (key: string, label: string, title: string) => (
-    <label className={s.checkLbl} title={title} style={{ color: 'var(--text)' }}>
-      <input type="checkbox" checked={!!cfg?.[key]} onChange={(e) => sendCmd({ type: 'set_config', key, value: e.target.checked })} />{label}
-    </label>
+    <div className={styles.feat}>
+      <div><div>{label}</div><div className={styles.hint}>{title}</div></div>
+      <Toggle checked={!!cfg?.[key]} onChange={(v) => sendCmd({ type: 'set_config', key, value: v })} label={label} />
+    </div>
   );
 
+  const sentCount = sent, drafts = llmLog.length - sent;
+  const nPending = rows.filter((r) => r.status === 'pending_reply').length;
   return (
     <div className={s.page}>
-      <div className={s.filters}>
-        <h2 className={s.title}>LLM авто-ответы</h2>
-        <button className={`${styles.toggleBtn} ${cfg?.llm_enabled ? styles.toggleOn : ''}`} disabled={toggleGlobal.busy} onClick={toggleGlobal.run}>
-          <Icon name={cfg?.llm_enabled ? 'play' : 'pause'} size={12} />{cfg?.llm_enabled ? 'ВКЛ' : 'ВЫКЛ'}
-        </button>
-        <select className={s.select} value={acc} onChange={(e) => setAcc(e.target.value)}>
-          <option value="">Все аккаунты</option>
-          {accFilterOpts.map((a) => <option key={a} value={a}>{fullByShort[a] ?? a}</option>)}
-        </select>
-        <select className={s.select} value={status} onChange={(e) => setStatus(e.target.value)}>
-          <option value="">Все статусы</option><option value="pending_reply">Ждёт ответа</option><option value="draft">Черновик</option><option value="replied">Отправлено</option>
-          <option value="no_reply_needed">Ответ не нужен</option><option value="chat_closed">Чат закрыт</option><option value="robot">Робот-рекрутер</option><option value="waiting_hr">Ждём HR</option>
-        </select>
-        <select className={s.select} value={sort} onChange={(e) => setSort(e.target.value)}>
-          <option value="date_desc">Недавние сверху</option><option value="date_asc">Старые сверху</option><option value="pending_first">Ждут ответа сверху</option>
-          <option value="oldest_pending">Дольше всех без ответа</option><option value="employer">По работодателю A–Z</option>
-        </select>
-        <input className={`${s.input} ${s.search}`} placeholder="Поиск: компания / вакансия / сообщение" value={q} onChange={(e) => setQ(e.target.value)} />
+      <PageHead title="ИИ-ответы работодателям" count={view.length === rows.length ? rows.length.toLocaleString('ru') : `${view.length} из ${rows.length}`} sub="Бот читает чаты с HR и отвечает от вашего имени. Здесь видно, что написал работодатель и что ответил ИИ.">
         <button className={s.btn} onClick={() => void load()}><Icon name="refresh-cw" size={13} />Обновить</button>
         <button className={s.btn} disabled={runNow.busy} onClick={runNow.run}><Icon name="play" size={13} />{runNow.msg ?? runNow.error ?? 'Запустить сейчас'}</button>
         <button className={s.btn} disabled={reset.busy} onClick={reset.run} title="Бот повторно обработает все чаты"><Icon name="repeat" size={13} />{reset.msg ?? reset.error ?? 'Сбросить «отвечали»'}</button>
-        <span className={s.dim}>{view.length === rows.length ? `${rows.length} записей` : `${view.length} из ${rows.length}`}</span>
+      </PageHead>
+
+      <div className={`${styles.banner} ${styles['b_' + state[1]]}`}>
+        <span className={styles.bannerDot} />
+        <div className={styles.bannerTxt}>
+          <b>{state[0]}</b>
+          <span>проверка каждые {Math.max(num(cfg?.llm_check_interval) || 5, 2)} мин · последний ответ: {llmLog[0]?.time ?? '—'}{(src.quick_reply || src.ai_letter || src.llm || src.cached) ? ` · источники: ${[src.quick_reply && `быстрые ответы HH ${src.quick_reply}`, src.ai_letter && `AI-письмо ${src.ai_letter}`, src.llm && `своя модель ${src.llm}`, src.cached && `кэш ${src.cached}`].filter(Boolean).join(', ')}` : ''}</span>
+        </div>
+        <label className={styles.master}>{cfg?.llm_enabled ? 'Включено' : 'Выключено'}<Toggle checked={!!cfg?.llm_enabled} disabled={toggleGlobal.busy} onChange={() => toggleGlobal.run()} label="ИИ-ответы" /></label>
       </div>
 
-      <div className={styles.bar}>
-        <b className={state[1]}>{state[0]}</b>
-        <span className={s.dim}>каждые {Math.max(num(cfg?.llm_check_interval) || 5, 2)}м · последний: {llmLog[0]?.time ?? '—'}</span>
-        <span className={s.accent}>{interviews} интервью{pending ? ` · ${pending} в обработке` : ''}</span>
-        <span className={s.ok}>{sent} отправлено · {llmLog.length - sent} черновиков</span>
-        <span className={s.grow} />
-        <span className={s.dim} title="Источники ответов из последних записей">
-          {src.quick_reply ? `quick ${src.quick_reply} · ` : ''}{src.ai_letter ? `ai-letter ${src.ai_letter} · ` : ''}{src.llm ? `llm ${src.llm} · ` : ''}{src.cached ? `кэш ${src.cached}` : ''}
-        </span>
+      <Stats items={[
+        { label: 'приглашений на интервью', value: interviews.toLocaleString('ru'), tone: interviews ? 'ok' : undefined },
+        { label: 'ждут ответа', value: nPending, tone: nPending ? 'bad' : undefined, hint: pending ? `${pending} сейчас в обработке` : undefined },
+        { label: 'отправлено ответов', value: sentCount.toLocaleString('ru'), tone: sentCount ? 'accent' : undefined },
+        { label: 'черновиков', value: drafts.toLocaleString('ru'), tone: drafts ? 'warn' : undefined },
+      ]} />
+
+      <div className={styles.cols}>
+        <section className={styles.panel}>
+          <h3>Аккаунты</h3>
+          {accs.length === 0 && <span className={s.dim}>Нет аккаунтов</span>}
+          {accs.map((a) => {
+            const on = a.llm_enabled !== false;
+            const c = byAcc[a.hh_short ?? a.short] ?? { pending: 0, draft: 0, replied: 0 };
+            return (
+              <div key={a.idx} className={`${styles.accRow} ${on ? '' : styles.off}`}>
+                <Avatar name={stripEmoji(a.name)} size={30} />
+                <div className={styles.accTxt}>
+                  <b>{stripEmoji(a.name)}</b>
+                  <span><i className={s.bad}>{c.pending} ждёт</i> · <i className={s.warn}>{c.draft} черн.</i> · <i className={s.ok}>{c.replied} отпр.</i></span>
+                </div>
+                <Toggle checked={on} onChange={() => sendCmd({ type: 'account_llm', idx: a.idx })} label={`ИИ-ответы: ${stripEmoji(a.name)}`} />
+              </div>
+            );
+          })}
+        </section>
+        <section className={styles.panel}>
+          <h3>Откуда брать ответы</h3>
+          {feat('llm_use_quick_replies', 'Быстрые ответы HH', 'HH сам предлагает варианты, вместо вашей модели')}
+          {feat('hh_ai_letter_first_try', 'AI-письмо HH', 'Бесплатное AI-письмо на пару «резюме × вакансия», до шаблона')}
+          {feat('related_vacancies_enabled', 'Похожие вакансии', 'Дополнительный источник вакансий из рекомендаций HH')}
+        </section>
       </div>
 
-      <div className={styles.feat}>
-        {feat('llm_use_quick_replies', 'HH quick_replies (вместо своего LLM)', 'HH сам генерит варианты ответа')}
-        {feat('hh_ai_letter_first_try', 'HH AI-letter (перед шаблоном)', '1 бесплатное AI-письмо на пару резюме×вакансия')}
-        {feat('related_vacancies_enabled', 'related_vacancies (доп. источник)', 'HH-рекомендательный фид как доп. источник')}
-      </div>
-
-      <div className={styles.accs}>
-        {accs.map((a) => {
-          const on = a.llm_enabled !== false;
-          return <button key={a.idx} className={`${styles.accBtn} ${on ? styles.on : ''}`} onClick={() => sendCmd({ type: 'account_llm', idx: a.idx })}>
-            <Icon name="dot" size={9} tone={on ? 'ok' : 'mute'} />{stripEmoji(a.name)}
-          </button>;
-        })}
-      </div>
-      <div className={styles.accs}>
-        {Object.entries(byAcc).map(([k, v]) => (
-          <div key={k} className={styles.stat}>
-            <b style={{ color: colorVar(v.color) }}>{fullByShort[k] ?? k}</b>
-            <div className={styles.counts}><span title="Ждёт ответа" className={s.bad}>{v.pending} ждёт</span><span title="Черновик" className={s.warn}>{v.draft} чернов.</span><span title="Отправлено" className={s.ok}>{v.replied} отпр.</span></div>
-          </div>
-        ))}
+      <div className={s.filters}>
+        <Search value={q} onChange={setQ} placeholder="Поиск: компания, вакансия, сообщение" />
+        <Select value={acc} onChange={(e) => setAcc(e.target.value)}>
+          <option value="">Все аккаунты</option>
+          {accFilterOpts.map((a) => <option key={a} value={a}>{fullByShort[a] ?? a}</option>)}
+        </Select>
+        <Select value={status} onChange={(e) => setStatus(e.target.value)}>
+          <option value="">Все статусы</option><option value="pending_reply">Ждёт ответа</option><option value="draft">Черновик</option><option value="replied">Отправлено</option>
+          <option value="no_reply_needed">Ответ не нужен</option><option value="chat_closed">Чат закрыт</option><option value="robot">Робот-рекрутер</option><option value="waiting_hr">Ждём HR</option>
+        </Select>
+        <Select value={sort} onChange={(e) => setSort(e.target.value)}>
+          <option value="date_desc">Недавние сверху</option><option value="date_asc">Старые сверху</option><option value="pending_first">Ждут ответа сверху</option>
+          <option value="oldest_pending">Дольше всех без ответа</option><option value="employer">По работодателю A–Z</option>
+        </Select>
       </div>
 
       {links.length > 0 && (
         <details className={styles.details}>
-          <summary className={s.warn}>{links.filter((l) => !done[`${l.neg}|${l.url}`]).length} ссылок от HR <span className={s.dim}>— формы, анкеты, тесты из чатов</span></summary>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginTop: 8 }}>
+          <summary><Icon name="link" size={14} /><span className={s.warn}>{links.filter((l) => !done[`${l.neg}|${l.url}`]).length} ссылок от HR</span><span className={s.dim}>формы, анкеты и тесты из чатов</span><Icon name="chevron-down" size={14} className="chev" /></summary>
+          <div className={styles.linkList}>
             {links.map((l) => {
               const k = `${l.neg}|${l.url}`;
               return (
@@ -205,7 +219,7 @@ export function LlmTab() {
                   <a href={safeHref(l.url)} target="_blank" rel="noopener noreferrer">{l.host}</a>
                   <a href={`https://hh.ru/chat/${encodeURIComponent(l.neg)}`} target="_blank" rel="noopener noreferrer" className={s.dim}>{l.employer}</a>
                   <span className={s.grow} />
-                  <button className={`${s.btn} ${s.btnSm}`} onClick={() => toggleDone(k)}>{done[k] ? 'Пройдено' : 'Пройти'}</button>
+                  <button className={`${s.btn} ${s.btnSm}`} onClick={() => toggleDone(k)}>{done[k] ? 'Пройдено' : 'Отметить пройденным'}</button>
                 </div>
               );
             })}
@@ -213,38 +227,39 @@ export function LlmTab() {
         </details>
       )}
 
-      <details className={styles.details}>
-        <summary>Отладочный лог LLM {dbg.length ? `(${dbg.length})` : ''}</summary>
-        <div className={styles.dbg}>
-          {dbg.length === 0 && <span className={s.dim}>Пусто</span>}
-          {dbg.map((e, i) => <div key={i}><span className={s.dim}>{e.time}</span> <Emoji text={e.message} size={11} /></div>)}
-        </div>
-      </details>
-
-      {!loaded && <div className={s.state}>Загрузка…</div>}
-      {loaded && rows.length === 0 && <div className={s.state}>Нет данных. Переговоры появятся после первого опроса HH-статистики (~15 мин).</div>}
+      {!loaded && <Skeleton />}
+      {loaded && rows.length === 0 && <Empty icon="bot" title="Пока нет переговоров" hint="Они появятся после первого опроса HH (примерно через 15 минут после запуска)." />}
+      {loaded && rows.length > 0 && shown.length === 0 && <Empty icon="search" title="Ничего не найдено" hint="Измените поиск или фильтры." />}
       {shown.length > 0 && (
         <div className={s.tableWrap}>
           <table className={s.table}>
-            <thead><tr><th>Обнаружен</th><th>Аккаунт</th><th>Работодатель</th><th>Вакансия</th><th>Сообщение работодателя</th><th>Ответ LLM</th><th>Статус</th><th>Чат</th></tr></thead>
+            <thead><tr><th>Работодатель</th><th>Сообщение HR</th><th>Ответ ИИ</th><th>Статус</th><th>Когда</th></tr></thead>
             <tbody>
               {shown.map((r, i) => {
-                const [sl, sc] = STATUS[r.status ?? ''] ?? ['—', s.dim];
+                const [sl, st] = STATUS[r.status ?? ''] ?? ['—', 'dim' as Tone];
                 const ch = CHAT[r.chat_status ?? ''];
                 const rt = r.vacancy_id ? ratings[r.vacancy_id] : null;
                 const rowCls = r.status === 'replied' ? styles.rowReplied : r.status === 'draft' ? styles.rowDraft : r.status === 'pending_reply' ? styles.rowPending : r.status === 'chat_closed' ? styles.rowClosed : '';
                 return (
                   <tr key={`${r.neg_id}-${i}`} className={rowCls}>
-                    <td className={`${s.dim} ${s.nowrap}`}>{(r.last_seen || r.first_seen || '').replace('T', ' ').slice(0, 16)}</td>
-                    <td style={{ color: colorVar(r.acc_color || '') }}>{r.acc}</td>
-                    <td>{r.employer} {r.neg_id && <a href={`https://hh.ru/chat/${encodeURIComponent(r.neg_id)}`} target="_blank" rel="noopener noreferrer"><Icon name="link" size={11} /></a>}
-                      {rt?.total ? <span className={rt.total >= 4.3 ? s.ok : rt.total >= 3.8 ? s.warn : s.bad} style={{ marginLeft: 6, fontSize: 11 }}><Icon name="star" size={10} /> {Number(rt.total).toFixed(1)}{rt.recommend_pct != null ? ` ${rt.recommend_pct}%` : ''}</span> : null}
+                    <td className={styles.emp}>
+                      <div className={styles.empName}>
+                        {r.employer}
+                        {r.neg_id && <a href={`https://hh.ru/chat/${encodeURIComponent(r.neg_id)}`} target="_blank" rel="noopener noreferrer" title="Открыть чат на HH"><Icon name="arrow-up-right" size={12} /></a>}
+                        {rt?.total ? <span className={rt.total >= 4.3 ? s.ok : rt.total >= 3.8 ? s.warn : s.bad} style={{ fontSize: 11 }} title="Рейтинг работодателя"><Icon name="star" size={10} /> {Number(rt.total).toFixed(1)}{rt.recommend_pct != null ? ` · ${rt.recommend_pct}%` : ''}</span> : null}
+                      </div>
+                      {r.vacancy_title && <div className={styles.empSub}>{r.vacancy_title}</div>}
+                      <div style={{ marginTop: 6 }}><AccChip name={r.acc || ''} /></div>
                     </td>
-                    <td className={s.dim}>{r.vacancy_title}</td>
-                    <td className={styles.msg}>{r.employer_last_msg || '—'}</td>
-                    <td className={styles.msg}>{r.llm_reply}</td>
-                    <td className={`${sc} ${s.nowrap}`}>{sl}</td>
-                    <td className={ch?.[1]}>{ch?.[0]}</td>
+                    <td className={styles.msg}><div className={styles.clamp}>{r.employer_last_msg || '—'}</div></td>
+                    <td className={styles.msg}><div className={styles.clamp}>{r.llm_reply || <span className={s.dim}>—</span>}</div></td>
+                    <td className={s.nowrap}>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'flex-start' }}>
+                        <Pill tone={st}>{sl}</Pill>
+                        {ch && <Pill tone={ch[1]}>{ch[0]}</Pill>}
+                      </div>
+                    </td>
+                    <td className={`${s.dim} ${s.nowrap}`}>{(r.last_seen || r.first_seen || '').replace('T', ' ').slice(5, 16).replace('-', '.')}</td>
                   </tr>
                 );
               })}
@@ -253,6 +268,14 @@ export function LlmTab() {
         </div>
       )}
       {view.length > shown.length && <div className={s.more}>Показано {shown.length} из {view.length} — уточните фильтр или поиск</div>}
+
+      <details className={styles.details}>
+        <summary><Icon name="scroll-text" size={14} /><span>Отладочный лог ИИ</span><span className={s.dim}>{dbg.length ? `${dbg.length} записей` : 'пусто'}</span><Icon name="chevron-down" size={14} className="chev" /></summary>
+        <div className={styles.dbg}>
+          {dbg.length === 0 && <span className={s.dim}>Пусто</span>}
+          {dbg.map((e, i) => <div key={i}><span className={s.dim}>{e.time}</span> <Emoji text={e.message} size={11} /></div>)}
+        </div>
+      </details>
     </div>
   );
 }

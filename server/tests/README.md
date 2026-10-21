@@ -22,7 +22,6 @@ python3 -m pytest
 
 - Async HTTP-флоу (`send_response_async`, `fill_and_submit_questionnaire`) — нужны mock'ы aiohttp. Pure-классификатор `classify_apply_response` вынесен и покрыт.
 - LLM API integration (`generate_llm_reply`) — нужны mock'ы OpenAI client. Покрыта только валидация ответа в hh_apply.
-- Frontend (`static/js/app.js`) — нужен node + jsdom. `esc()` критично, осталось без покрытия.
 
 ## Что нашли сами тесты
 

@@ -1,6 +1,8 @@
 import { useRef, useState } from 'react';
+import { confirmDialog } from '@/ui/dialog';
 import { Icon } from '@/components/Icon';
 import { api, get, post, del } from '@/lib/api';
+import { useApp } from '@/store/app';
 import s from '@/ui/Ui.module.css';
 import m from './Settings.module.css';
 import { Hint, Hr, Sect } from './kit';
@@ -68,8 +70,8 @@ export function JsonBackup() {
       const lost = lostFields(cur, parsed);
       const msg = lost.length
         ? `Потеряются непустые поля:\n• ${lost.join('\n• ')}\n\nПродолжить (затрёт всё)?`
-        : 'Сохранить и перезаписать ВСЕ data/*.json? Текущие данные потеряются.';
-      if (!window.confirm(msg)) { setBusy(false); return; }
+        : 'Заменить данные в локальной базе содержимым JSON? Текущие данные будут перезаписаны.';
+      if (!(await confirmDialog(msg, { danger: true }))) { setBusy(false); return; }
       afterWrite(await post<SaveRes>('/api/backup', parsed as never));
     } catch (e) { say(String(e), 'bad'); }
     setBusy(false);
@@ -77,14 +79,14 @@ export function JsonBackup() {
   const restore = async (f: File) => {
     try {
       const parsed = JSON.parse(await f.text()) as Obj;
-      if (!window.confirm(`Восстановить из «${f.name}»? Текущие data/*.json будут перезаписаны.`)) return;
+      if (!(await confirmDialog(`Восстановить из «${f.name}»? Текущие данные в локальной базе будут перезаписаны.`, { danger: true }))) return;
       afterWrite(await post<SaveRes>('/api/backup', parsed as never));
     } catch (e) { say(String(e), 'bad'); }
     if (file.current) file.current.value = '';
   };
   const wipe = async () => {
-    if (!window.confirm('Удалить ВСЕ данные (аккаунты, шаблоны, пул)? Действие необратимо.')) return;
-    if (!window.confirm('Точно стереть? Это второе подтверждение.')) return;
+    if (!(await confirmDialog('Удалить ВСЕ данные (аккаунты, шаблоны, пул)? Действие необратимо.', { danger: true }))) return;
+    if (!(await confirmDialog('Точно стереть? Это второе подтверждение.', { danger: true, ok: 'Стереть' }))) return;
     try {
       const r = await del<{ cleared?: string[] }>('/api/backup');
       say(`Очищено: ${(r.cleared ?? []).join(', ')}`, 'ok'); void load();
@@ -93,7 +95,7 @@ export function JsonBackup() {
 
   return (
     <Sect icon="database" title="JSON и бэкап">
-      <Hint>Прямое редактирование data/*.json одним документом. Перед сохранением проверяется, не потеряются ли непустые поля.</Hint>
+      <Hint>Экспорт и восстановление локальной базы SQLite в формате JSON. Бэкап содержит секреты аккаунтов — не публикуйте его. Перед сохранением проверяется, не потеряются ли непустые поля.</Hint>
       <div className={m.inline}>
         <button className={s.btn} onClick={async () => { try { download(`hh-backup-${stamp()}.json`, JSON.stringify(await get('/api/backup'), null, 2)); } catch (e) { say(String(e), 'bad'); } }}><Icon name="download" size={13} />Скачать бэкап</button>
         <button className={s.btn} onClick={() => file.current?.click()}><Icon name="upload" size={13} />Восстановить из файла</button>
@@ -116,6 +118,7 @@ export function JsonBackup() {
 
 export function Diagnostics() {
   const [info, setInfo] = useState('');
+  const sum = useApp((x) => x.snapshot?.config?.llm_status_summary);
   const fetchBundle = async () => {
     setInfo('читаю…');
     const r = await api<unknown>('/api/diagnostic_bundle');
@@ -134,6 +137,11 @@ export function Diagnostics() {
         }}><Icon name="copy" size={13} />Копировать</button>
         <button className={s.btn} onClick={async () => { try { download(`hh-bot-diag-${stamp()}.txt`, await fetchBundle(), 'text/plain'); } catch (e) { setInfo(String(e)); } }}><Icon name="download" size={13} />Скачать</button>
         <span className={`${m.status} ${s.dim}`}>{info}</span>
+      </div>
+      <div className={m.diag}>
+        <div><b>LLM provider:</b> {String(sum?.configured_provider ?? '—')}</div>
+        <div><b>Reply:</b> <span className={s.dim}>{sum?.reply ? JSON.stringify(sum.reply) : '—'}</span></div>
+        <div><b>Questionnaire:</b> <span className={s.dim}>{sum?.questionnaire ? JSON.stringify(sum.questionnaire) : '—'}</span></div>
       </div>
     </Sect>
   );

@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { useApp, useT } from '@/store/app';
+import { Slider } from '@/ui/radix';
 import s from '@/ui/Ui.module.css';
 import m from './Settings.module.css';
 import { Sect, useFlash } from './kit';
@@ -22,7 +23,6 @@ export function BotParams() {
   const send = useApp((x) => x.sendCmd);
   const [drafts, setDrafts] = useState<Record<string, number>>({});
   const [flash, setFlash] = useFlash();
-  const sum = cfg?.llm_status_summary;
   return (
     <Sect icon="sliders-horizontal" title={t('settings_title')} open>
       <div className={m.grid}>
@@ -32,20 +32,12 @@ export function BotParams() {
             <div key={d.key} className={m.rowS}>
               <div className={m.lbl}><span>{t('lbl_' + d.key)}</span><span className={m.val}>{d.float ? cur.toFixed(1) : cur}</span></div>
               <div className={s.dim} style={{ fontSize: 11.5 }}>{t('hint_' + d.key)}</div>
-              <input className={m.range} type="range" min={d.min} max={d.max} step={d.step} value={cur} onChange={(e) => setDrafts((x) => ({ ...x, [d.key]: Number(e.target.value) }))} />
+              <Slider min={d.min} max={d.max} step={d.step} value={cur} label={t('lbl_' + d.key)} onChange={(v) => setDrafts((x) => ({ ...x, [d.key]: v }))} onCommit={(v) => { send({ type: 'set_config', key: d.key, value: v }); setFlash('Сохранено'); }} />
             </div>
           );
         })}
       </div>
-      <div className={m.inline}>
-        <button className={s.btn} onClick={() => { for (const [key, value] of Object.entries(drafts)) send({ type: 'set_config', key, value }); setDrafts({}); setFlash(t('settings_applied')); }} disabled={!Object.keys(drafts).length}>{t('btn_apply_settings')}</button>
-        <span className={`${m.status} ${s.ok}`}>{flash}</span>
-      </div>
-      <div className={m.diag}>
-        <div><b>LLM provider:</b> {String(sum?.configured_provider ?? '—')}</div>
-        <div><b>Reply:</b> <span className={s.dim}>{sum?.reply ? JSON.stringify(sum.reply) : '—'}</span></div>
-        <div><b>Questionnaire:</b> <span className={s.dim}>{sum?.questionnaire ? JSON.stringify(sum.questionnaire) : '—'}</span></div>
-      </div>
+      {flash && <div className={`${m.status} ${s.ok}`}>{flash}</div>}
     </Sect>
   );
 }

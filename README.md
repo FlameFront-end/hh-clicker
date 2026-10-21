@@ -13,7 +13,7 @@ client/       React + TypeScript + Vite
 server/
   app/        FastAPI и логика бота
   tests/      Python-тесты
-  scripts/    обслуживание, миграции и запуск e2e
+  scripts/    обслуживание и миграции
   web_app.py  точка запуска
 data/         SQLite, диагностические логи и runtime-lock (не коммитить)
 .env          локальные секреты (не коммитить)
@@ -47,7 +47,7 @@ npm --prefix client run build
 ```
 
 Dev-интерфейс: <http://localhost:5173/>. API и WebSocket проксируются на порт 8000.
-Сборка пишется в `client/static/dist/` и доступна по `/static/dist/index.html`.
+Сборка пишется в `client/static/dist/`; сервер отдаёт её на `/` (маршруты — через hash: `/#/settings`).
 
 ## Разработка сервера
 

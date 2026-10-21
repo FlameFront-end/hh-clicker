@@ -2,7 +2,6 @@
 
 import asyncio
 import types
-from pathlib import Path
 
 import app.routes.apply as apply_route
 from app.instances import bot
@@ -109,10 +108,3 @@ def test_submit_encodes_checkbox_as_repeated_fields(monkeypatch):
     assert captured.count(("task_2", "django")) == 1
     assert captured.count(("task_2", "fastapi")) == 1
     assert not any(name == "task_2" and value.startswith("[") for name, value in captured)
-
-
-def test_apply_result_messages_are_rendered_as_text():
-    source = (Path(__file__).parents[2] / "client/static/js/app.js").read_text(encoding="utf-8")
-    function = source[source.index("function applyShowResult"):source.index("function applyHideQuestionnaire")]
-    assert "el.textContent = msg" in function
-    assert "el.innerHTML = msg" not in function

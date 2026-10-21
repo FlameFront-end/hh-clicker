@@ -8,11 +8,11 @@ import { Err, Item, Section, useLoader, type Json } from './bits';
 const hhVac = (id: string) => `https://hh.ru/vacancy/${encodeURIComponent(id)}`;
 
 export function HotLeads({ idx }: { idx: string }) {
-  const l = useLoader(() => get<Json>(`/api/account/${idx}/hot_leads`));
+  const l = useLoader(() => get<Json>(`/api/account/${idx}/hot_leads`), idx || undefined);
   const offers: Json[] = l.data?.offers ?? [];
   return (
-    <Section icon="flame" title="Горячие лиды" tone={s.warn}
-      actions={<button className={s.btn} disabled={l.busy || !idx} onClick={l.run}>Загрузить</button>}
+    <Section icon="flame" title="Горячие лиды" desc="Работодатели, которые проявили к вам интерес" tone={s.warn}
+      actions={<button className={s.btn} disabled={l.busy || !idx} onClick={l.run}>Обновить</button>}
       status={l.busy ? 'Загружаю…' : l.data ? `${l.data.total ?? 0} работодателей` : <Err text={l.err} />}>
       {l.data && !offers.length && <span className={s.dim}>Нет горячих лидов</span>}
       {offers.map((o, i) => (
@@ -24,11 +24,11 @@ export function HotLeads({ idx }: { idx: string }) {
 }
 
 export function HrContacts() {
-  const l = useLoader(() => get<Json>('/api/hr_contacts'));
+  const l = useLoader(() => get<Json>('/api/hr_contacts'), 'hr');
   const rows: Json[] = (l.data?.contacts ?? []).slice().reverse();
   return (
-    <Section icon="contact" title="Контакты HR"
-      actions={<button className={s.btn} disabled={l.busy} onClick={l.run}>Загрузить</button>}
+    <Section icon="contact" title="Контакты HR" desc="Собираются автоматически при откликах"
+      actions={<button className={s.btn} disabled={l.busy} onClick={l.run}>Обновить</button>}
       status={l.busy ? 'Загружаю…' : l.data ? `${l.data.total ?? 0} контактов` : <Err text={l.err} />}>
       {l.data && !rows.length && <span className={s.dim}>Нет собранных контактов — они собираются автоматически при откликах.</span>}
       {rows.length > 0 && (
@@ -50,11 +50,11 @@ export function HrContacts() {
 }
 
 export function Remindable({ idx }: { idx: string }) {
-  const l = useLoader(() => get<Json>(`/api/account/${idx}/remindable`));
+  const l = useLoader(() => get<Json>(`/api/account/${idx}/remindable`), idx || undefined);
   const items: Json[] = l.data?.remindable ?? [];
   return (
-    <Section icon="bell" title="Можно напомнить"
-      actions={<button className={s.btn} disabled={l.busy || !idx} onClick={l.run}>Проверить</button>}
+    <Section icon="bell" title="Можно напомнить" desc="Переговоры, где можно отправить напоминание работодателю"
+      actions={<button className={s.btn} disabled={l.busy || !idx} onClick={l.run}>Обновить</button>}
       status={l.busy ? 'Проверяю…' : l.data ? `${l.data.total ?? 0} переговоров` : <Err text={l.err} />}>
       {l.data && !items.length && <span className={s.dim}>Нет переговоров, где можно отправить напоминание.</span>}
       {items.map((it, i) => <Item key={i} title={it.employer || '?'} sub={it.vacancy} />)}
@@ -75,12 +75,12 @@ export function OAuthBox({ idx }: { idx: string }) {
     finally { setBusy(false); }
   };
   return (
-    <Section icon="key-round" title="OAuth API" tone={s.ok}
+    <Section icon="key-round" title="Доступ через API HH" desc="Токен для откликов и подъёма резюме без браузерной сессии" tone={s.ok}
       actions={<>
         <button className={s.btn} disabled={busy || !idx} onClick={() => void act('oauth_token', (d) => d.ok ? [`Токен получен · ${Math.round(d.expires_in / 3600)}ч · refresh: ${d.has_refresh ? 'да' : 'нет'}`, 'ok'] : [d.error || 'Ошибка', 'bad'])}>Получить токен</button>
         <button className={s.btn} disabled={busy || !idx} onClick={() => void act('oauth_touch', (d) => d.ok ? [d.message, 'ok'] : [d.message || d.error, 'warn'])}>Поднять резюме</button>
       </>}
-      status={<span className={s[st.kind]}>{st.text}</span>} />
+      status={st.text ? <span className={s[st.kind]}>{st.text}</span> : undefined} />
   );
 }
 

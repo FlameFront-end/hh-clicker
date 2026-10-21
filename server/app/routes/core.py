@@ -3,7 +3,6 @@ Core routes: startup, index, websocket, global pause, broadcast loop.
 """
 
 import asyncio
-import re
 from pathlib import Path
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -30,24 +29,20 @@ router = APIRouter()
 # ============================================================
 
 _STATIC_DIR = Path(__file__).resolve().parents[3] / "client" / "static"
-_ASSET_REF_RE = re.compile(r'(src|href)="(/static/[^"?]+)\?v=\d+"')
-
-
-def _bust(match: re.Match) -> str:
-    attr, path = match.group(1), match.group(2)
-    rel = path[len("/static/"):]
-    try:
-        mtime = int((_STATIC_DIR / rel).stat().st_mtime)
-    except OSError:
-        return match.group(0)
-    return f'{attr}="{path}?v={mtime}"'
+_NO_CACHE = {"Cache-Control": "no-cache, no-store, must-revalidate"}
 
 
 @router.get("/")
 async def index():
-    html = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
-    html = _ASSET_REF_RE.sub(_bust, html)
-    return HTMLResponse(html, headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
+    """React-дашборд: сборка лежит в client/static/dist (npm --prefix client run build)."""
+    built = _STATIC_DIR / "dist" / "index.html"
+    if not built.is_file():
+        return HTMLResponse(
+            "<h3>Фронтенд не собран</h3><p>Выполните <code>npm --prefix client ci &amp;&amp; "
+            "npm --prefix client run build</code> или пересоберите Docker-образ.</p>",
+            status_code=503,
+        )
+    return HTMLResponse(built.read_text(encoding="utf-8"), headers=_NO_CACHE)
 
 
 # ============================================================

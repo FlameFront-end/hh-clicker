@@ -1,4 +1,5 @@
 import { stripEmoji } from '@/components/Icon';
+import { Select } from '@/ui/radix';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Icon } from '@/components/Icon';
 import { api, ApiError, post } from '@/lib/api';
@@ -14,7 +15,7 @@ export function HediTab() {
   const accounts = useApp((x) => x.snapshot?.accounts) ?? [];
   const [idx, setIdx] = useState<number | null>(null);
   const [msgs, setMsgs] = useState<Msg[]>([]);
-  const [status, setStatus] = useState<{ t: string; err: boolean }>({ t: 'Выберите mobile-аккаунт для начала чата.', err: false });
+  const [status, setStatus] = useState<{ t: string; err: boolean }>({ t: '', err: false });
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
   const loading = useRef(false);
@@ -51,34 +52,45 @@ export function HediTab() {
     finally { setBusy(false); }
   };
 
+  const SUGGEST = ['Подбери вакансии под моё резюме', 'Что улучшить в резюме?', 'Какие вакансии сейчас в тренде?'];
   return (
     <div className={styles.shell}>
-      <div className={styles.bar}>
-        <div><h2 className={s.title}>HH Хэдди</h2><div className={s.dim} style={{ fontSize: 11 }}>Bot: Хэдди · powered by HH.ru AI</div></div>
+      <header className={styles.bar}>
+        <span className={styles.logo}><Icon name="sparkles" size={16} /></span>
+        <div className={styles.ttl}><h2>HH Хэдди</h2><span>ИИ-помощник hh.ru: советы по резюме и подбор вакансий</span></div>
         <span className={s.grow} />
-        <select className={s.select} value={cur ?? ''} onChange={(e) => setIdx(Number(e.target.value))}>
+        <Select value={cur ?? ''} onChange={(e) => setIdx(Number(e.target.value))}>
           {accounts.map((a) => <option key={a.idx} value={a.idx}>{stripEmoji(a.name || a.short)}</option>)}
-        </select>
-        <button className={s.btn} onClick={() => void load(true)}><Icon name="refresh-cw" size={13} />Обновить историю</button>
+        </Select>
+        <button className={s.btn} onClick={() => void load(true)}><Icon name="refresh-cw" size={13} />Обновить</button>
+      </header>
+      <div className={styles.chat}>
+        <div className={styles.msgs} ref={box}>
+          {msgs.length === 0 && (
+            <div className={styles.empty}>
+              <span className={styles.logo}><Icon name="sparkles" size={18} /></span>
+              <b>Спросите Хэдди о вакансиях</b>
+              <p>Например, попросите подобрать работу или подсказать, как улучшить резюме.</p>
+              <div className={styles.chips}>{SUGGEST.map((q) => <button key={q} className={styles.chip} onClick={() => setText(q)}>{q}</button>)}</div>
+            </div>
+          )}
+          {msgs.map((m, i) => {
+            const user = m.sender === 'applicant';
+            return (
+              <div key={i} className={`${styles.msg} ${user ? styles.user : ''}`}>
+                <div className={styles.avatar}><Icon name={user ? 'user' : 'sparkles'} size={14} /></div>
+                <div className={styles.bubble}><div>{m.text}</div><div className={styles.time}>{time(m.timestamp || m.created_at)}</div></div>
+              </div>
+            );
+          })}
+        </div>
+        <div className={styles.compose}>
+          <textarea className={styles.ta} rows={1} maxLength={4000} placeholder="Напишите Хэдди…  (Enter — отправить, Shift+Enter — новая строка)" value={text} onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send(); } }} />
+          <button className={styles.send} disabled={busy || !text.trim()} onClick={() => void send()} aria-label="Отправить"><Icon name="send" size={15} /></button>
+        </div>
       </div>
       <div className={`${styles.status} ${status.err ? s.bad : ''}`}>{status.t}</div>
-      <div className={styles.msgs} ref={box}>
-        {msgs.length === 0 && <div className={styles.empty}>История пуста. Спросите Хэдди о подходящих вакансиях.</div>}
-        {msgs.map((m, i) => {
-          const user = m.sender === 'applicant';
-          return (
-            <div key={i} className={`${styles.msg} ${user ? styles.user : ''}`}>
-              <div className={styles.avatar}><Icon name={user ? 'user' : 'bot'} size={14} /></div>
-              <div className={styles.bubble}><div>{m.text}</div><div className={styles.time}>{time(m.timestamp || m.created_at)}</div></div>
-            </div>
-          );
-        })}
-      </div>
-      <div className={styles.compose}>
-        <textarea className={styles.ta} rows={3} maxLength={4000} placeholder="Напишите Хэдди…" value={text} onChange={(e) => setText(e.target.value)}
-          onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send(); } }} />
-        <button className={styles.send} disabled={busy} onClick={() => void send()}><Icon name="send" size={14} />Отправить</button>
-      </div>
     </div>
   );
 }

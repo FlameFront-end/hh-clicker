@@ -71,7 +71,7 @@ Thumbs.db
 *.log
 
 # Local tooling
-react-b*.tgz
+react-*.tgz
 *.bak
 .openclaw/
 AGENTS.md

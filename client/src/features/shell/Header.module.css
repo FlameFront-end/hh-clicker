@@ -22,3 +22,10 @@
 .popup { position: absolute; right: 0; top: 32px; width: 360px; max-height: 360px; overflow: auto; background: var(--card); border: 1px solid var(--border-hi); border-radius: var(--r); padding: 10px 12px; box-shadow: 0 12px 40px rgba(0,0,0,.5); z-index: 30; }
 .popupHead { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; margin: 6px 0 4px; }
 .popupItem { font-size: 12px; padding: 3px 0; }
+@media (max-width: 760px) {
+  .header { padding: 8px 12px; gap: 8px 10px; position: static; }
+  .stats { order: 5; flex-basis: 100%; flex-wrap: nowrap; overflow-x: auto; white-space: nowrap; gap: 12px; padding-bottom: 2px; }
+  .spacer { display: none; }
+  .header > :last-child { margin-left: auto; }
+}
+.hh { padding-left: 14px; border-left: 1px solid var(--border); }
