@@ -132,12 +132,14 @@ export function LlmTab() {
   const dbg = (snap?.log ?? []).filter((e) => (e.message || '').includes('🤖') || (e.message || '').includes('LLM'));
   const src = llmLog.reduce<Record<string, number>>((m, r) => { const k = r.source || 'other'; m[k] = (m[k] || 0) + 1; return m; }, {});
 
-  const feat = (key: string, label: string, title: string) => (
-    <div className={styles.feat}>
-      <div><div>{label}</div><div className={styles.hint}>{title}</div></div>
-      <Toggle checked={!!cfg?.[key]} onChange={(v) => sendCmd({ type: 'set_config', key, value: v })} label={label} />
+  const feat = (key: string, label: string, title: string, off?: string) => (
+    <div className={styles.feat} style={off ? { opacity: 0.5 } : undefined} title={off}>
+      <div><div>{label}</div><div className={styles.hint}>{off || title}</div></div>
+      <Toggle checked={!!cfg?.[key] && !off} disabled={!!off} onChange={(v) => sendCmd({ type: 'set_config', key, value: v })} label={label} />
     </div>
   );
+  // AI-письмо HH работает только при отклике через сайт (не через API).
+  const webApply = !cfg?.use_oauth_apply && accs.some((a) => !a.use_oauth);
 
   const sentCount = sent, drafts = llmLog.length - sent;
   const nPending = rows.filter((r) => r.status === 'pending_reply').length;
@@ -187,7 +189,7 @@ export function LlmTab() {
         <section className={styles.panel}>
           <h3>Откуда брать ответы</h3>
           {feat('llm_use_quick_replies', 'Быстрые ответы HH', 'HH сам предлагает варианты, вместо вашей модели')}
-          {feat('hh_ai_letter_first_try', 'AI-письмо HH', 'Бесплатное AI-письмо на пару «резюме × вакансия», до шаблона')}
+          {feat('hh_ai_letter_first_try', 'AI-письмо HH', 'Бесплатное AI-письмо на пару «резюме × вакансия», до шаблона', webApply ? undefined : 'Недоступно: все профили откликаются через API HH, а AI-письмо есть только при отклике через сайт')}
           {feat('related_vacancies_enabled', 'Похожие вакансии', 'Дополнительный источник вакансий из рекомендаций HH')}
         </section>
       </div>

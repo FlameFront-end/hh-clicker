@@ -1,11 +1,14 @@
 import { Dialog, Tabs } from 'radix-ui';
+import { useEffect, useState } from 'react';
+import { confirmDiscardChanges } from '@/lib/unsaved';
 import { Emoji, Icon, stripEmoji } from '@/components/Icon';
 import { fmtInt, num } from '@/lib/format';
 import { useApp, useT } from '@/store/app';
 import { promptDialog } from '@/ui/dialog';
 import type { Account } from '@/types/snapshot';
 import { Autosearches, AutoResponse, Bell, CareerRadar, Conversion, Hidden, Visibility } from './panels/Data';
-import { Letter, ResumePicker, SmartFilters, UrlPanel } from './panels/Local';
+import { Letter, ResumePicker } from './panels/Local';
+import { SearchTab } from './panels/Search';
 import { plural, statusOf } from './status';
 import { useAccount } from './useAccount';
 import r from '@/ui/Radix.module.css';
@@ -86,12 +89,16 @@ function Body({ acc }: { acc: Account }) {
         {acc.action_history?.length > 0 && <div className={s.hist}>{acc.action_history.slice(-5).join('  |  ')}</div>}
       </Tabs.Content>
 
+      <Tabs.Content value="search" className={s.pane}>
+        <SearchTab acc={acc} />
+      </Tabs.Content>
+
       <Tabs.Content value="apply" className={s.pane}>
         <section className={s.block}>
           <h4>Как откликаться</h4>
           <div className={s.group}>
-            <Row title={t('card_apply_tests')} hint="Откликаться и на вакансии, где работодатель просит пройти тест"><Toggle checked={a.applyTests} onChange={a.toggleApplyTests} label={t('card_apply_tests')} /></Row>
-            <Row title="Откликаться через API HH" hint="Стабильнее веб-сессии; выключите, чтобы откликаться через браузерные cookies"><Toggle checked={!!acc.use_oauth} onChange={a.toggleOauth} label="OAuth" /></Row>
+            <Row title={t('card_apply_tests')} hint={cfg.auto_apply_tests ? 'Включено общей настройкой для всех профилей. Выключается в Настройки → Поиск.' : 'Откликаться и на вакансии, где работодатель просит пройти тест'}><Toggle checked={!!cfg.auto_apply_tests || a.applyTests} disabled={!!cfg.auto_apply_tests} onChange={a.toggleApplyTests} label={t('card_apply_tests')} /></Row>
+            <Row title="Откликаться через API HH" hint={cfg.use_oauth_apply ? 'API включён общей настройкой. Чтобы выбрать сайт для профиля, сначала выключите общий режим в Настройки → Поиск.' : acc.degraded_mode ? 'Сейчас используется запасной API: веб-сессия устарела.' : 'Выключено — основной канал сайт; запасной API настраивается отдельно.'}><Toggle checked={!!cfg.use_oauth_apply || !!acc.use_oauth} disabled={!!cfg.use_oauth_apply} onChange={a.toggleOauth} label="OAuth" /></Row>
             <Row title="Запасной канал через API" hint="Если веб-сессия устарела, продолжать откликаться через API HH"><Toggle checked={a.degraded} onChange={a.toggleDegraded} label="OAuth-fallback" /></Row>
           </div>
         </section>
@@ -99,14 +106,12 @@ function Body({ acc }: { acc: Account }) {
           <h4>Резюме и чаты</h4>
           <div className={s.group}>
             <Row title="Поднимать резюме автоматически" hint="Резюме будет чаще показываться работодателям в поиске"><Toggle checked={a.autoTouch} onChange={a.toggleTouch} label="Авто-подъём" /></Row>
-            <Row title="Отвечать HR через ИИ" hint="ИИ сам ответит на сообщения работодателей в чатах"><Toggle checked={a.llmOn} onChange={a.toggleLlm} label="LLM-ответы" /></Row>
+            <Row title="Отвечать HR через ИИ" hint={!cfg.llm_enabled ? 'ИИ выключен общей настройкой. Настройки → ИИ.' : cfg.llm_auto_send ? 'ИИ автоматически отправляет ответы работодателям.' : 'Только черновики: ИИ ничего не отправляет автоматически.'}><Toggle checked={!!cfg.llm_enabled && a.llmOn} disabled={!cfg.llm_enabled} onChange={a.toggleLlm} label="LLM-ответы" /></Row>
           </div>
         </section>
         <section className={s.block}>
-          <h4>Что и куда отправлять</h4>
+          <h4>Письмо и резюме</h4>
           <Letter acc={acc} />
-          <UrlPanel acc={acc} />
-          <SmartFilters acc={acc} />
           {acc.temp && <ResumePicker acc={acc} />}
         </section>
       </Tabs.Content>
@@ -134,25 +139,28 @@ function Body({ acc }: { acc: Account }) {
   );
 }
 
-export function AccountSheet({ acc, onClose }: { acc: Account | undefined; onClose: () => void }) {
+export function AccountSheet({ acc, onClose, tab = 'overview' }: { acc: Account | undefined; onClose: () => void; tab?: string }) {
   const t = useT();
   const snap = useApp((x) => x.snapshot);
+  const [activeTab, setActiveTab] = useState(tab);
+  useEffect(() => { setActiveTab(tab); }, [acc?.idx, tab]);
   return (
-    <Dialog.Root open={!!acc} onOpenChange={(o) => !o && onClose()}>
+    <Dialog.Root open={!!acc} onOpenChange={(o) => { if (!o && confirmDiscardChanges()) onClose(); }}>
       <Dialog.Portal>
         <Dialog.Overlay className={r.overlay} />
         <Dialog.Content className={r.sheet} aria-describedby={undefined}>
           {acc && snap && (
-            <Tabs.Root defaultValue="overview" className={s.root}>
+            <Tabs.Root key={`${acc.idx}:${tab}`} value={activeTab} onValueChange={(v) => { if (confirmDiscardChanges()) setActiveTab(v); }} className={s.root}>
               <header className={s.head}>
                 <div>
                   <Dialog.Title className={s.title}>{stripEmoji(acc.name).replace(/\s*\(\s*\)/, '')}<button className={s.rename} aria-label="Переименовать" title="Переименовать" onClick={async () => { const v = await promptDialog(`Своё название для «${acc.hh_name ?? acc.name}» (пусто — вернуть исходное):`, acc.hh_name ? acc.name : ''); if (v !== null) useApp.getState().setAlias(acc.hh_name ?? acc.name, v); }}><Icon name="pencil" size={13} /></button></Dialog.Title>
-                  <div className={s.sub}>{statusOf(acc, snap, t).label} · {acc.use_oauth ? 'через API HH' : 'через веб-сессию'}</div>
+                  <div className={s.sub}>{statusOf(acc, snap, t).label} · {acc.effective_oauth ? 'через API HH' : 'через веб-сессию'}</div>
                 </div>
                 <Dialog.Close className={s.close} aria-label="Закрыть"><Icon name="x" size={16} /></Dialog.Close>
               </header>
               <Tabs.List className={r.tabList}>
                 <Tabs.Trigger className={r.tab} value="overview">Обзор</Tabs.Trigger>
+                <Tabs.Trigger className={r.tab} value="search">Поиск вакансий</Tabs.Trigger>
                 <Tabs.Trigger className={r.tab} value="apply">Настройки откликов</Tabs.Trigger>
                 <Tabs.Trigger className={r.tab} value="hh">Инструменты HH</Tabs.Trigger>
               </Tabs.List>

@@ -148,3 +148,6 @@ button.item:hover { border-color: var(--border-hi); }
 .urlPages { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 12px; flex-shrink: 0; }
 .urlPages input { width: 64px; min-width: 0; }
 .emptyRow { padding: 18px; text-align: center; color: var(--dim); font-size: 12.5px; border: 1px dashed var(--border-hi); border-radius: 10px; }
+.override { display: flex; flex-direction: column; gap: 3px; padding: 10px 12px; border: 1px solid rgba(217,164,65,.35); border-radius: 10px; background: var(--warn-dim); font-size: 12px; }
+.override b { color: var(--warn); font-weight: 500; }
+.override span { color: var(--dim); }

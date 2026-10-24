@@ -35,9 +35,9 @@ export function MenuItem({ icon, children, onSelect, danger, disabled, right }: 
     </DropdownMenu.Item>
   );
 }
-export function MenuCheck({ icon, children, checked, onChange }: { icon?: IconName; children: ReactNode; checked: boolean; onChange: (v: boolean) => void }) {
+export function MenuCheck({ icon, children, checked, onChange, disabled }: { icon?: IconName; children: ReactNode; checked: boolean; onChange: (v: boolean) => void; disabled?: boolean }) {
   return (
-    <DropdownMenu.CheckboxItem className={r.item} checked={checked} onCheckedChange={onChange} onSelect={(e) => e.preventDefault()}>
+    <DropdownMenu.CheckboxItem className={r.item} checked={checked} disabled={disabled} onCheckedChange={onChange} onSelect={(e) => e.preventDefault()}>
       {icon && <Icon name={icon} size={14} />}{children}
       <span className={r.check}><DropdownMenu.ItemIndicator><Icon name="check" size={13} tone="ok" /></DropdownMenu.ItemIndicator></span>
     </DropdownMenu.CheckboxItem>
@@ -50,13 +50,16 @@ const EMPTY = '__empty__';
 const textOf = (n: ReactNode): string => (Array.isArray(n) ? n.map(textOf).join('') : n == null || typeof n === 'boolean' ? '' : String(n));
 type Opt = { value: string; label: string; disabled?: boolean };
 
-export function Select({ value, onChange, children, style, disabled, placeholder }: {
+export function Select({ value, onChange, children, style, disabled, placeholder, 'aria-label': ariaLabel, 'aria-labelledby': ariaLabelledBy, id }: {
   value?: string | number;
   onChange: (e: { target: { value: string } }) => void;
   children: ReactNode;
   style?: CSSProperties;
   disabled?: boolean;
   placeholder?: string;
+  'aria-label'?: string;
+  'aria-labelledby'?: string;
+  id?: string;
 }) {
   const opts: Opt[] = [];
   Children.forEach(children, (c) => {
@@ -69,7 +72,7 @@ export function Select({ value, onChange, children, style, disabled, placeholder
   const hit = opts.find((o) => o.value === cur) ?? opts.find((o) => o.value === '');
   return (
     <RSelect.Root value={cur === '' ? EMPTY : cur} onValueChange={(v) => onChange({ target: { value: v === EMPTY ? '' : v } })} disabled={disabled}>
-      <RSelect.Trigger className={r.select} style={style} aria-label={placeholder}>
+      <RSelect.Trigger id={id} className={r.select} style={style} aria-label={ariaLabel ?? placeholder} aria-labelledby={ariaLabelledBy}>
         <span className={r.selectVal}>{hit?.label || placeholder || '—'}</span>
         <RSelect.Icon><Icon name="chevron-down" size={14} /></RSelect.Icon>
       </RSelect.Trigger>

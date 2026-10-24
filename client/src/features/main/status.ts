@@ -13,11 +13,13 @@ const MAP: Record<string, [IconName, string, Tone, string]> = {
   limit: ['ban', 'Упёрся в лимит', 'bad', 'HH ограничил отклики — бот подождёт сброса'],
   waiting: ['hourglass', 'Перерыв между циклами', 'idle', 'Круг закончен, бот ждёт и начнёт новый поиск сам'],
   checking: ['search', 'Проверяет лимит', 'run', 'Проверяет, снял ли HH ограничение'],
+  error: ['triangle-alert', 'Ошибка — нужен журнал', 'bad', 'Откройте журнал, чтобы узнать причину и время повторной попытки'],
   '—': ['circle', 'Не активен', 'idle', ''],
 };
 
-export function statusOf(acc: Account, snap: Snapshot, _t?: (k: string) => string): StatusView {
+function statusRu(acc: Account, snap: Snapshot): StatusView {
   if (snap.paused) return { label: 'Всё на паузе', tone: 'idle', icon: 'pause', title: 'Включена общая пауза (кнопка вверху справа)' };
+  if (acc.temp && !acc.bot_active) return { label: 'Сессия остановлена', tone: 'idle', icon: 'square', title: 'Запустите сессию через меню профиля' };
   if (acc.paused) {
     const hhUsed = num(acc.hh_today_applies);
     const hhLimit = num(acc.hh_daily_limit) || 200;
@@ -27,20 +29,44 @@ export function statusOf(acc: Account, snap: Snapshot, _t?: (k: string) => strin
       return { label: `Дневной лимит: ${acc.daily_sent} из ${acc.daily_limit}`, tone: 'bad', icon: 'octagon-x', title: 'Ваш лимит откликов на день исчерпан. Сбросится завтра в 00:00' };
     if (acc.limit_exceeded)
       return { label: 'HH ограничил отклики', tone: 'bad', icon: 'ban', title: acc.status_detail || 'Бот проверит снятие лимита автоматически' };
+    if (acc.paused_reason === 'review')
+      return { label: 'Проверьте отклик', tone: 'warn', icon: 'clipboard-list', title: 'HH не подтвердил отправку. Проверьте отклик на HH; если его нет, разрешите повтор во вкладке «Тесты», затем включите профиль' };
+    if (acc.paused_reason === 'captcha')
+      return { label: 'Нужна проверка HH', tone: 'warn', icon: 'shield', title: 'HH попросил пройти капчу. Пройдите её по ссылке в карточке и включите профиль' };
+    if (acc.paused_reason === 'auth')
+      return { label: 'Нужен вход в HH', tone: 'bad', icon: 'key-round', title: 'Сессия HH устарела. Обновите куки или войдите заново' };
+    if (acc.paused_reason === 'auto_errors')
+      return { label: 'Пауза после ошибок', tone: 'warn', icon: 'triangle-alert', title: 'Несколько ошибок отправки подряд. Посмотрите журнал и включите профиль' };
     return { label: 'На паузе', tone: 'idle', icon: 'pause', title: 'Включите переключатель, чтобы бот продолжил' };
   }
   const m = MAP[acc.status];
   return { label: m ? m[1] : String(acc.status), tone: m?.[2] ?? 'idle', icon: m?.[0] ?? 'circle-help', title: m?.[3] || undefined };
 }
 
+export function statusOf(acc: Account, snap: Snapshot, _t?: (k: string) => string, en = false): StatusView {
+  const base = statusRu(acc, snap);
+  if (!en) return base;
+  const labels: Record<string, string> = { idle: 'Ready', collecting: 'Searching vacancies', applying: 'Sending applications', waiting: 'Between search cycles', checking: 'Checking HH allowance', limit: 'HH restriction', error: 'Error — check the log', '—': 'Inactive' };
+  const reasons: Record<string, string> = { captcha: 'HH verification required', auth: 'Sign in to HH', review: 'Review application on HH', auto_errors: 'Paused after send errors', limit: 'Daily allowance reached', manual: 'Paused' };
+  return { ...base, label: snap.paused ? 'All applications paused' : acc.temp && !acc.bot_active ? 'Session stopped' : acc.paused ? (reasons[acc.paused_reason] || 'Paused') : (labels[acc.status] || acc.status), title: undefined };
+}
+
 /** Понятная строка «что сейчас происходит» из технического status_detail. */
-export function humanDetail(detail: string | undefined | null): string {
+export function humanDetail(detail: string | undefined | null, en = false): string {
   const d = (detail || '').trim();
   if (!d) return '';
+  if (en) {
+    const query = d.match(/^Поисковые запросы:\s*(\d+)\s*из\s*(\d+)/i);
+    if (query) return `Search queries: ${query[1]} of ${query[2]}`;
+    const progress = d.match(/^(?:OAuth-сбор|Web-сбор|Загрузка)\s+(\d+)\s*\/\s*(\d+)/i);
+    if (progress) return `Search progress: ${progress[1]} of ${progress[2]}`;
+    if (/^нет новых вакансий/i.test(d)) return 'No new matching vacancies';
+    if (/^цикл завершён/i.test(d)) return 'Search cycle completed';
+  }
   let m = d.match(/^OAuth-сбор\s+(\d+)\s*\/\s*(\d+)/i);
-  if (m) return `Собрано ${m[1]} из ${m[2]} вакансий`;
+  if (m) return `Страницы поиска: ${m[1]} из ${m[2]}`;
   m = d.match(/^(?:Web-)?сбор\s+(\d+)\s*\/\s*(\d+)/i);
-  if (m) return `Собрано ${m[1]} из ${m[2]} вакансий`;
+  if (m) return `Страницы поиска: ${m[1]} из ${m[2]}`;
   if (/^нет новых вакансий/i.test(d)) return 'Новых вакансий нет — проверит снова в следующем круге';
   return d;
 }

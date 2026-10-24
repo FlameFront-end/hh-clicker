@@ -43,10 +43,26 @@ export interface Account {
   experience: unknown[];
   letter: string;
   urls: string[];
+  search_source_mode?: 'selected' | 'inherit';
+  include_saved_searches?: boolean;
+  active_search_urls?: string[];
+  profile_filter_keys?: string[];
   url_pages: Record<string, number>;
   url_stats: Record<string, number>;
   status: AccountStatus;
   status_detail: string;
+  can_run_now?: boolean;
+  sent_today?: number;
+  last_sent_at?: string;
+  unique_tests?: number;
+  unique_already?: number;
+  next_search_at?: string;
+  last_search_at?: string;
+  hh_stats_checked_at?: string;
+  cycle_summary?: { found: number; eligible: number; already: number; tests: number; filtered: number };
+  effective_oauth?: boolean;
+  /** Профили одного пользователя HH делят дневной лимит. */
+  hh_user_id?: string;
   sent: number;
   total_applied: number;
   tests: number;
@@ -86,6 +102,7 @@ export interface Account {
   resume_global_invitations: number;
   resume_new_invitations_total: number;
   acc_event_log: AccEvent[];
+  apply_errors?: { time: string; vacancy_id: string; title: string; reason: string; http_status?: number | null; error_code?: string }[];
   apply_tests: boolean;
   safety_enabled: boolean;
   safety_inconsistent_skipped: number;
@@ -138,6 +155,8 @@ export interface EmployerRating {
 }
 
 export interface RecentResponse {
+  error_detail?: { reason: string; http_status?: number | null; error_code?: string };
+  account_name?: string;
   time: string;
   acc: string;
   color: string;
@@ -220,6 +239,7 @@ export interface Snapshot {
   type: 'state_update';
   uptime_seconds: number;
   paused: boolean;
+  dashboard?: { today: number; last_24h: number; hourly: number[]; day_timezone: string; generated_at: string };
   accounts: Account[];
   recent_responses: RecentResponse[];
   log: LogEntry[];

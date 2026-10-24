@@ -22,17 +22,20 @@ export function BotParams() {
   const cfg = useApp((x) => x.snapshot?.config);
   const send = useApp((x) => x.sendCmd);
   const [drafts, setDrafts] = useState<Record<string, number>>({});
+  // Mobile-поиск физически ограничен 20 страницами — больше ставить бессмысленно.
+  const hasWeb = (useApp((x) => x.snapshot?.accounts) ?? []).some((acc) => !['mobile', 'oauth'].includes(String(acc.mode || '').toLowerCase()));
   const [flash, setFlash] = useFlash();
   return (
     <Sect icon="sliders-horizontal" title={t('settings_title')} open>
       <div className={m.grid}>
         {DEF.map((d) => {
-          const cur = drafts[d.key] ?? Number(cfg?.[d.key] ?? d.min);
+          const max = d.key === 'pages_per_url' && !hasWeb ? 20 : d.max;
+          const cur = Math.min(drafts[d.key] ?? Number(cfg?.[d.key] ?? d.min), max);
           return (
             <div key={d.key} className={m.rowS}>
               <div className={m.lbl}><span>{t('lbl_' + d.key)}</span><span className={m.val}>{d.float ? cur.toFixed(1) : cur}</span></div>
-              <div className={s.dim} style={{ fontSize: 11.5 }}>{t('hint_' + d.key)}</div>
-              <Slider min={d.min} max={d.max} step={d.step} value={cur} label={t('lbl_' + d.key)} onChange={(v) => setDrafts((x) => ({ ...x, [d.key]: v }))} onCommit={(v) => { send({ type: 'set_config', key: d.key, value: v }); setFlash('Сохранено'); }} />
+              <div className={s.dim} style={{ fontSize: 11.5 }}>{t('hint_' + d.key)}{d.key === 'pages_per_url' && !hasWeb ? ' · для mobile-профилей максимум 20' : ''}</div>
+              <Slider min={d.min} max={max} step={d.step} value={cur} label={t('lbl_' + d.key)} onChange={(v) => setDrafts((x) => ({ ...x, [d.key]: v }))} onCommit={(v) => { send({ type: 'set_config', key: d.key, value: v }); setFlash('Сохранено'); }} />
             </div>
           );
         })}

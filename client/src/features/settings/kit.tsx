@@ -5,6 +5,7 @@ import type { IconName } from '@/components/icons';
 import { useApp } from '@/store/app';
 import s from '@/ui/Ui.module.css';
 import m from './Settings.module.css';
+import { useUnsavedChanges } from '@/lib/unsaved';
 
 export const Group = ({ children }: { children: ReactNode }) => <div className={m.group}>{children}</div>;
 
@@ -87,8 +88,9 @@ export function CfgSelect({ k, options, number }: { k: string; options: [string,
   );
 }
 
-export function TagInput({ tags, onChange, tone, placeholder }: { tags: string[]; onChange: (t: string[]) => void; tone: 'ok' | 'bad'; placeholder: string }) {
+export function TagInput({ tags, onChange, tone, placeholder, label }: { tags: string[]; onChange: (t: string[]) => void; tone: 'ok' | 'bad'; placeholder: string; label?: string }) {
   const [v, setV] = useState('');
+  useUnsavedChanges(!!v.trim());
   const commit = (raw: string) => {
     const add = raw.split(/[,;\n]/).map((x) => x.trim().toLowerCase()).filter(Boolean).filter((x) => !tags.includes(x));
     if (add.length) onChange([...tags, ...add]);
@@ -97,9 +99,9 @@ export function TagInput({ tags, onChange, tone, placeholder }: { tags: string[]
   return (
     <div>
       <div className={m.tags}>
-        {tags.map((t) => <span key={t} className={`${m.tag} ${tone === 'ok' ? m.tagOk : m.tagBad}`}>{t}<button onClick={() => onChange(tags.filter((x) => x !== t))} aria-label="Убрать"><Icon name="x" size={11} /></button></span>)}
+        {tags.map((t) => <span key={t} className={`${m.tag} ${tone === 'ok' ? m.tagOk : m.tagBad}`}>{t}<button type="button" onClick={() => onChange(tags.filter((x) => x !== t))} aria-label={`Убрать ${t}`}><Icon name="x" size={11} /></button></span>)}
       </div>
-      <input className={s.input} style={{ width: '100%' }} value={v} placeholder={placeholder}
+      <input aria-label={label ?? placeholder} className={s.input} style={{ width: '100%' }} value={v} placeholder={placeholder}
         onChange={(e) => setV(e.target.value)} onBlur={() => v.trim() && commit(v)}
         onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); commit(v); } }} />
     </div>
@@ -141,13 +143,14 @@ export function Row({ title, hint, children, off }: { title: ReactNode; hint?: R
 }
 
 /** Переключатель, привязанный к ключу конфига. */
-export function CfgSwitch({ k, title, hint, invert }: { k: string; title: ReactNode; hint?: ReactNode; invert?: boolean }) {
+/** unavailable — причина, по которой настройка сейчас не действует (показываем серым). */
+export function CfgSwitch({ k, title, hint, invert, unavailable }: { k: string; title: ReactNode; hint?: ReactNode; invert?: boolean; unavailable?: string }) {
   const v = useApp((x) => x.snapshot?.config?.[k]);
   const send = useApp((x) => x.sendCmd);
   const checked = invert ? v === false : !!v;
   return (
-    <Row title={title} hint={hint}>
-      <Toggle checked={checked} label={typeof title === 'string' ? title : k} onChange={(on) => send({ type: 'set_config', key: k, value: invert ? !on : on })} />
+    <Row title={title} hint={unavailable || hint} off={!!unavailable}>
+      <Toggle checked={checked && !unavailable} disabled={!!unavailable} label={typeof title === 'string' ? title : k} onChange={(on) => send({ type: 'set_config', key: k, value: invert ? !on : on })} />
     </Row>
   );
 }
@@ -177,5 +180,5 @@ export function ChipSet({ options, value, onChange }: { options: [string, string
 
 /** Ряд действий: кнопки + статус. */
 export const Actions = ({ children, status, tone }: { children: ReactNode; status?: ReactNode; tone?: 'ok' | 'bad' | 'warn' }) => (
-  <div className={m.actions}>{children}{status ? <span className={`${m.status} ${tone ? s[tone] : s.dim}`}>{status}</span> : null}</div>
+  <div className={m.actions}>{children}{status ? <span role="status" className={`${m.status} ${tone ? s[tone] : s.dim}`}>{status}</span> : null}</div>
 );

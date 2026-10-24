@@ -20,11 +20,11 @@ export function Header() {
   const accs = snap?.accounts ?? [];
   const cfg = snap?.config;
   const gs = snap?.global_stats;
-  const totalDaily = accs.reduce((s, a) => s + num(a.daily_sent), 0);
+  const totalDaily = snap?.dashboard?.today;
   const limit = num(cfg?.daily_apply_limit);
   const stopped = accs.some((a) => a.hard_stopped);
   const pausedAccs = accs.filter((a) => a.paused).length;
-  const oauthCount = accs.filter((a) => a.use_oauth).length;
+  const oauthCount = accs.filter((a) => a.effective_oauth ?? a.use_oauth).length;
   const globalOAuth = !!cfg?.use_oauth_apply;
   const oauthOn = oauthCount > 0 || globalOAuth;
 
@@ -37,14 +37,12 @@ export function Header() {
   return (
     <header className={styles.header}>
       <span className={`${styles.conn} ${connected ? styles.on : ''}`} title={`${connected ? 'Подключено' : 'Нет связи'} · работает ${fmtUptime(snap?.uptime_seconds ?? 0)}`} />
-      <h1 className={styles.title}>HH Bot</h1>
+      <span className={styles.title}>HH Bot</span>
 
       <div className={styles.stats}>
         <span title={t('hdr_replies')}><Icon name="check" size={13} tone="ok" /> <b className="tnum">{gs?.total_sent ?? 0}</b> {t('hdr_replies')}
-          {limit > 0 && <em className={totalDaily >= limit ? styles.bad : styles.dim}> · сегодня {totalDaily}/{limit}</em>}
-          {limit <= 0 && totalDaily > 0 && <em className={stopped ? styles.bad : styles.dim}> · сегодня {totalDaily}</em>}
+          {totalDaily !== undefined && <em className={stopped ? styles.bad : styles.dim} title={limit > 0 ? `Ваш лимит: ${limit} в день на каждый профиль` : 'Подтверждённые отправки в истории · сутки по Москве'}> · {lang === 'en' ? 'today' : 'сегодня'} {totalDaily}</em>}
         </span>
-        <span title={`${t('hdr_in_db')} · с тестом: ${gs?.storage_tests ?? 0}`}><Icon name="database" size={13} /> <b className="tnum">{gs?.storage_total ?? 0}</b> {t('hdr_in_db')}</span>
       </div>
 
       {(inboxChats + inboxNeg + viewsNew + inv > 0) && (
@@ -81,18 +79,19 @@ export function Header() {
         </span>
       )}
 
-      <button
+      <span
         className={`${styles.badge} ${oauthOn ? styles.okBadge : styles.accentBadge}`}
-        title="Переключить глобальный режим откликов (OAuth/Web)"
-        onClick={() => sendCmd({ type: 'set_config', key: 'use_oauth_apply', value: !globalOAuth })}
+        title={lang === 'en' ? 'Effective application transport. Configure it in profile details.' : 'Фактический способ отправки. Настраивается в деталях профиля.'}
       >
         <Icon name={oauthOn ? 'key-round' : 'globe'} size={12} />
-        {oauthOn ? (globalOAuth ? 'OAuth (все)' : `OAuth (${oauthCount}/${accs.length})`) : 'Web'}
-      </button>
+        {oauthOn ? `API ${oauthCount}/${accs.length}` : 'Web'}
+      </span>
 
       <button className={styles.btn} onClick={toggleLang} title="Язык / Language">{lang === 'ru' ? 'RU' : 'EN'}</button>
       <button
         className={`${styles.btn} ${snap?.paused ? styles.paused : ''}`}
+        disabled={!connected}
+        aria-label={snap?.paused ? (lang === 'en' ? 'Resume all profiles' : 'Возобновить все профили') : (lang === 'en' ? 'Pause all profiles' : 'Поставить все профили на паузу')}
         onClick={() => sendCmd({ type: 'pause_toggle' })}
       >
         <Icon name={snap?.paused ? 'play' : 'pause'} size={13} />

@@ -5,11 +5,10 @@ import { useApp, useT } from '@/store/app';
 import { num } from '@/lib/format';
 import { Empty, PageHead, Seg, Stats } from '@/ui/Kit';
 import s from '@/ui/Ui.module.css';
-import v from './Views.module.css';
 import { Audit } from './Audit';
 import { AccountHistory } from './History';
 import { Resumes } from './Resumes';
-import { HotLeads, HrContacts, OAuthBox, Remindable } from './Tools';
+import { HotLeads, HrContacts, OAuthBox } from './Tools';
 
 export function ViewsTab() {
   const t = useT();
@@ -38,18 +37,13 @@ export function ViewsTab() {
       <Seg value={tab} onChange={setTab} options={[
         { id: 'views', label: 'Кто смотрел' },
         { id: 'audit', label: 'Аудит резюме' },
-        { id: 'leads', label: 'Лиды и напоминания' },
+        { id: 'leads', label: 'Горячие лиды' },
         { id: 'hr', label: 'Контакты HR' },
         { id: 'tools', label: 'Резюме и доступ' },
       ]} />
       {tab === 'views' && (acc ? <AccountHistory key={acc.idx} acc={acc} /> : <Empty icon="eye" title="Нет аккаунтов" hint="Добавьте аккаунт в настройках." />)}
       {tab === 'audit' && <Audit idx={idx} />}
-      {tab === 'leads' && (
-        <div className={v.grid2}>
-          <HotLeads idx={idx} />
-          <Remindable idx={idx} />
-        </div>
-      )}
+      {tab === 'leads' && <HotLeads idx={idx} />}
       {tab === 'hr' && <HrContacts />}
       {tab === 'tools' && (
         <>

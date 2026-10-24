@@ -1,7 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Select } from '@/ui/radix';
 import { Icon, stripEmoji } from '@/components/Icon';
-import { get } from '@/lib/api';
+import { get, post } from '@/lib/api';
+import { useDraft } from '@/lib/useDraft';
+import { confirmDiscardChanges, useUnsavedChanges } from '@/lib/unsaved';
 import { useApp, useT } from '@/store/app';
 import type { UrlPoolItem } from '@/types/snapshot';
 import s from '@/ui/Ui.module.css';
@@ -67,18 +69,36 @@ function Suggest({ onAdd, has }: { onAdd: (url: string) => void; has: (url: stri
 
 export function UrlPool() {
   const t = useT();
-  const send = useApp((x) => x.sendCmd);
+  const connected = useApp((x) => x.connected);
   const cfg = useApp((x) => x.snapshot?.config);
   const global = Number(cfg?.pages_per_url ?? 40);
-  const source = cfg?.url_pool as UrlPoolItem[] | undefined;
-  const [rows, setRows] = useState<{ url: string; pages: string }[]>([]);
-  const [dirty, setDirty] = useState(false);
+  // Mobile-профили берут одну общую глубину (не больше 20 стр.) — поле «стр.» на них не действует.
+  const hasWeb = (useApp((x) => x.snapshot?.accounts) ?? []).some((a) => !['mobile', 'oauth'].includes(String(a.mode || '').toLowerCase()));
+  const source = cfg?.url_pool as (UrlPoolItem | string)[] | undefined;
+  const [busy, setBusy] = useState(false);
+  const asRows = (items: (UrlPoolItem | string)[]) => items.map((u) => ({ url: typeof u === 'string' ? u : u.url, pages: String(typeof u === 'string' ? global : u.pages ?? global) }));
+  const { base, draft: rows, setDraft: setRows, dirty, accept, reset } = useDraft(asRows(source ?? []), busy);
+  useUnsavedChanges(dirty || busy);
   const [flash, setFlash] = useFlash();
-  const sig = JSON.stringify(source ?? []);
-  useEffect(() => { if (!dirty) setRows((source ?? []).map((u) => ({ url: u.url, pages: String(u.pages ?? '') }))); }, [sig]); // eslint-disable-line react-hooks/exhaustive-deps
-  const edit = (f: (r: typeof rows) => typeof rows) => { setDirty(true); setRows(f); };
+  const [tone, setTone] = useState<'ok' | 'bad' | undefined>(undefined);
+  const edit = (f: (r: typeof rows) => typeof rows) => { setRows(f); setFlash(''); };
+  const save = async () => {
+    if (busy || !connected || !dirty) return;
+    setBusy(true); setTone(undefined); setFlash('Сохраняю…');
+    const urls = rows.map((r) => ({ url: r.url.trim(), pages: Number(r.pages) || global })).filter((u) => u.url);
+    try {
+      const result = await post<{ ok?: boolean; urls: UrlPoolItem[]; error?: string }>('/api/search-pool', {
+        action: 'replace', urls, base_urls: base.map((r) => ({ url: r.url, pages: Number(r.pages) || global })),
+      });
+      if (!result.ok) throw new Error(result.error || 'Не удалось сохранить пул');
+      accept(asRows(result.urls)); setTone('ok'); setFlash(`Сохранено (${result.urls.length} URL)`);
+    } catch (e) { setTone('bad'); setFlash(`Сохранение не подтверждено: ${e instanceof Error ? e.message : String(e)}. Черновик оставлен.`); }
+    finally { setBusy(false); }
+  };
   return (
     <Sect icon="link" title={t('sec_url_pool')}>
+      {!connected && <p role="status">Нет связи с сервером. Сохранение недоступно; черновик оставлен.</p>}
+      <fieldset disabled={busy || !connected} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
       <Hint>Ссылки поиска вакансий появятся как чекбоксы на карточке аккаунта. «Стр.» — глубина поиска для ссылки; пусто — общее значение ({global}).</Hint>
       {rows.length === 0 && <div className={m.emptyRow}>Пока нет ссылок. Добавьте URL поиска с hh.ru или подберите по резюме.</div>}
       {rows.length > 0 && (
@@ -87,20 +107,19 @@ export function UrlPool() {
             <div key={i} className={m.urlItem}>
               <span className={m.urlNum}>{i + 1}</span>
               <input className={`${s.input} ${m.urlInp}`} placeholder="https://hh.ru/search/vacancy?…" value={r.url} title={r.url} onChange={(e) => edit((a) => a.map((x, n) => (n === i ? { ...x, url: e.target.value } : x)))} />
-              <label className={m.urlPages}><span>стр.</span><input className={s.input} type="number" min={1} max={100} placeholder={String(global)} value={r.pages} onChange={(e) => edit((a) => a.map((x, n) => (n === i ? { ...x, pages: e.target.value } : x)))} /></label>
+              <label className={m.urlPages} title={hasWeb ? undefined : 'Для mobile-профилей действует общая глубина из «Скорость и лимиты»'} style={hasWeb ? undefined : { opacity: 0.45 }}><span>стр.</span><input className={s.input} type="number" min={1} max={100} disabled={!hasWeb} placeholder={String(global)} value={r.pages} onChange={(e) => edit((a) => a.map((x, n) => (n === i ? { ...x, pages: e.target.value } : x)))} /></label>
               <button className={`${s.btn} ${s.btnDanger} ${s.btnSm}`} aria-label="Удалить" onClick={() => edit((a) => a.filter((_, n) => n !== i))}><Icon name="x" size={12} /></button>
             </div>
           ))}
         </div>
       )}
       <Suggest has={(u) => rows.some((r) => r.url === u)} onAdd={(u) => edit((a) => [...a, { url: u, pages: '' }])} />
-      <Actions status={flash} tone="ok">
+      <Actions status={flash || (dirty ? 'Есть несохранённые изменения' : '')} tone={tone}>
         <button className={s.btn} onClick={() => edit((a) => [...a, { url: '', pages: '' }])}><Icon name="plus" size={13} />Добавить URL</button>
-        <button className={`${s.btn} ${s.btnOn}`} onClick={() => {
-          const urls = rows.map((r) => ({ url: r.url.trim(), pages: parseInt(r.pages, 10) || global })).filter((u) => u.url);
-          send({ type: 'set_url_pool', urls }); setDirty(false); setFlash(`Сохранено (${urls.length} URL)`);
-        }}>{t('btn_save_pool')}</button>
+        <button disabled={!dirty} className={`${s.btn} ${s.btnOn}`} onClick={() => void save()}>{busy ? 'Сохраняю…' : t('btn_save_pool')}</button>
+        <button className={s.btn} onClick={() => { if (confirmDiscardChanges()) { reset(); setFlash(''); } }}>Загрузить актуальные ссылки</button>
       </Actions>
+      </fieldset>
     </Sect>
   );
 }

@@ -6,6 +6,7 @@ import { useApp, useT } from '@/store/app';
 import { AccChip, Empty, PageHead, Search, Seg } from '@/ui/Kit';
 import s from '@/ui/Ui.module.css';
 import styles from './LogTab.module.css';
+import { eventTime, parseStamp } from '@/features/main/metrics';
 
 const LVL: Record<string, { icon: IconName; label: string }> = {
   success: { icon: 'check', label: 'Успешно' },
@@ -18,6 +19,11 @@ type Level = '' | 'success' | 'warning' | 'error' | 'info';
 export function LogTab() {
   const t = useT();
   const log = useApp((x) => x.snapshot?.log) ?? [];
+  const accounts = useApp((x) => x.snapshot?.accounts) ?? [];
+  const label = (short: string) => {
+    const matching = accounts.filter((a) => (a.hh_short ?? a.short) === short);
+    return matching.length === 1 ? matching[0]!.name : matching.length > 1 ? `${short} · несколько профилей` : short;
+  };
   const [q, setQ] = useState('');
   const [acc, setAcc] = useState('');
   const [level, setLevel] = useState<Level>('');
@@ -35,12 +41,12 @@ export function LogTab() {
 
   return (
     <div className={s.page}>
-      <PageHead title="Журнал событий" count={entries.length.toLocaleString('ru')} sub="Что бот делал в последнее время: отклики, проверки, ошибки." />
+      <PageHead title="Журнал событий" count={entries.length.toLocaleString('ru')} sub="Только последние 100 событий этого запуска. Это не полная история ошибок; даты — в вашем часовом поясе." />
       <div className={styles.bar}>
         <Search value={q} onChange={setQ} placeholder={t('log_search_ph')} />
         <Select value={acc} onChange={(e) => setAcc(e.target.value)}>
           <option value="">{t('log_all_accs')}</option>
-          {accs.map((a) => <option key={a} value={a}>{a}</option>)}
+          {accs.map((a) => <option key={a} value={a}>{label(a)}</option>)}
         </Select>
         <Seg<Level> value={level} onChange={setLevel} options={[
           { id: '', label: 'Все', count: base.length },
@@ -57,11 +63,11 @@ export function LogTab() {
             const l = LVL[e.level] ?? LVL.info!;
             return (
               <div key={i} className={`${styles.item} ${styles['l' + e.level]}`}>
-                <span className={styles.time}>{e.time}</span>
+                <time className={styles.time} dateTime={parseStamp(e.time) !== null ? e.time : undefined}>{parseStamp(e.time) !== null ? eventTime(e.time) : `${e.time} · дата неизвестна`}</time>
                 <span className={styles.ico}><Icon name={l.icon} size={12} /></span>
                 <div className={styles.body}>
                   <span className={styles.msg}><Emoji text={e.message} size={13} /></span>
-                  {e.acc && <AccChip name={e.acc} />}
+                  {e.acc && <AccChip name={label(e.acc)} />}
                 </div>
               </div>
             );

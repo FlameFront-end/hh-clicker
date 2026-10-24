@@ -5,7 +5,7 @@ import { get, post } from '@/lib/api';
 import { useApp } from '@/store/app';
 import s from '@/ui/Ui.module.css';
 import m from './Settings.module.css';
-import { Actions, Block, CfgSwitch, Field, Rows, Sect } from './kit';
+import { Actions, Block, CfgSelect, CfgSwitch, Field, Row, Rows, Sect } from './kit';
 import { stripEmoji } from '@/components/Icon';
 
 interface Profile { name: string; api_key: string; base_url: string; model: string; enabled: boolean; key_set?: boolean; key_fingerprint?: string }
@@ -27,6 +27,7 @@ export function LlmSettings() {
   const cfg = useApp((x) => x.snapshot?.config);
   const accs = useApp((x) => x.snapshot?.accounts) ?? [];
   const send = useApp((x) => x.sendCmd);
+  const webApply = !cfg?.use_oauth_apply && accs.some((a) => !a.use_oauth);
   const srv = (cfg?.llm_profiles as Profile[] | undefined) ?? [];
   const [profiles, setProfiles] = useState<Profile[] | null>(null);
   const [mode, setMode] = useState<string | null>(null);
@@ -114,11 +115,13 @@ export function LlmSettings() {
       <Block title="Поведение" desc="Бот отвечает работодателям в переговорах со статусом «Интервью» через OpenAI-совместимый API. Включается кнопкой на вкладке «LLM Ответы».">
         <Rows>
           <CfgSwitch k="llm_auto_send" title="Отправлять автоматически" hint="Выключено — ответы только пишутся в лог" />
+          <Row title="Проверять чаты каждые" hint="Новые сообщения через WebSocket приходят сразу; это запасной интервал"><CfgSelect k="llm_check_interval" number options={[['2', '2 мин'], ['5', '5 мин'], ['10', '10 мин'], ['15', '15 мин'], ['30', '30 мин']]} /></Row>
           <CfgSwitch k="llm_use_resume" title="Учитывать резюме" />
           <CfgSwitch k="llm_use_cover_letter" title="Учитывать сопроводительное письмо" />
           <CfgSwitch k="llm_fill_questionnaire" title="Заполнять опросники нейронкой" hint="Отвечает на вопросы работодателя при отклике (текст, radio, checkbox). Шаблоны — запасной вариант." />
           <CfgSwitch k="llm_use_quick_replies" title="Быстрые ответы HH вместо своего LLM" hint="quick_replies — готовые варианты от самого HH" />
-          <CfgSwitch k="hh_ai_letter_first_try" title="Сначала письмо от HH-AI" hint="Шаблон используется, если HH-AI не справился" />
+          <CfgSwitch k="hh_ai_letter_first_try" title="Сначала письмо от HH-AI" hint="Шаблон используется, если HH-AI не справился"
+            unavailable={webApply ? undefined : 'Недоступно: все профили откликаются через API HH, а AI-письмо есть только при отклике через сайт'} />
           <CfgSwitch k="related_vacancies_enabled" title="Расширять пул через related_vacancies" hint="Похожие вакансии добавляются к результатам поиска" />
         </Rows>
       </Block>

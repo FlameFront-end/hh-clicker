@@ -1,5 +1,11 @@
 // Сгенерировано из static/js/app.js (объект T). Эмодзи убраны — иконки рисуют компоненты.
 export const en = {
+  "run_now": "Check now",
+  "run_now_starting": "Starting…",
+  "run_now_hint": "Start a new search without waiting between cycles. Matching jobs are processed using your rules.",
+  "run_now_unavailable": "Available between cycles. Does not override pauses, CAPTCHA or application limits.",
+  "run_now_queued": "Wait interrupted — starting a new cycle",
+  "run_now_failed": "Could not start the check",
   "tab_main": "Main",
   "tab_log": "Log",
   "tab_llm": "LLM Replies",

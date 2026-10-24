@@ -1,48 +1,39 @@
-import { Emoji, Icon, stripEmoji } from '@/components/Icon';
+import { useState } from 'react';
+import { Link } from 'react-router-dom';
+import { Icon, stripEmoji } from '@/components/Icon';
 import { useAliasOf, useApp } from '@/store/app';
-import type { RecentResponse } from '@/types/snapshot';
-import styles from './Recent.module.css';
-
-function Chips({ r }: { r: RecentResponse }) {
-  const er = r.employer_rating;
-  return (
-    <span className={styles.chips}>
-      {r.hr_online && <span className={styles.chip} title="HR онлайн"><Icon name="dot" size={10} tone="ok" /> онлайн</span>}
-      {r.accept_auto === false && <span className={styles.chip} title="Не принимает автоотклики"><Icon name="ban" size={11} tone="warn" /> без авто</span>}
-      {er && er.rating > 0 && <span className={styles.chip} title={`${er.reviews_count} отзывов · ${er.recommendations_percent}% рекомендуют`}><Icon name="star" size={11} tone="warn" /> {er.rating.toFixed(1)}</span>}
-    </span>
-  );
-}
-
-/** «06:02» для сегодняшних, «20 окт, 18:17» для прошлых. */
-function shortTime(raw: string): string {
-  const d = new Date(raw.replace(' ', 'T'));
-  if (Number.isNaN(d.getTime())) return raw;
-  const hm = d.toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit' });
-  return d.toDateString() === new Date().toDateString() ? hm : `${d.toLocaleDateString('ru', { day: 'numeric', month: 'short' })}, ${hm}`;
-}
+import { mainCopy } from './copy';
+import { eventTime, applyErrorReason } from './metrics';
+import s from './Recent.module.css';
 
 export function Recent() {
-  const list = useApp((s) => s.snapshot?.recent_responses) ?? [];
+  const list = useApp((x) => x.snapshot?.recent_responses) ?? [];
+  const en = useApp((x) => x.lang) === 'en';
+  const c = mainCopy(en);
   const alias = useAliasOf();
-  return (
-    <section className={styles.card}>
-      <h3 className={styles.title}>Последние отклики</h3>
-      <div className={styles.list}>
-        {list.length === 0 && <div className={styles.none}>Откликов пока не было</div>}
-        {list.slice(0, 40).map((r, i) => (
-          <div key={`${r.id}-${i}`} className={styles.item}>
-            <div className={styles.row1}>
-              <span className={styles.time} title={r.time}>{shortTime(r.time)}</span>
-              <span className={styles.acc}>{stripEmoji(alias(r.acc))}</span>
-              <span className={styles.res}><Emoji text={r.icon} size={12} /></span>
-            </div>
-            <div className={styles.vac} title={r.title}>{r.title}</div>
-            <div className={styles.meta}>{r.company}{r.salary ? ` · ${r.salary}` : ''}</div>
-            <Chips r={r} />
-          </div>
-        ))}
-      </div>
-    </section>
-  );
+  const [filter, setFilter] = useState('all');
+  const labels: Record<string, string> = { sent: c.sent, test: c.test, already: c.already, error: c.error, limit: c.limit, captcha: c.attention };
+  const rows = list.filter((r) => filter === 'all' || (filter === 'sent' ? r.result === 'sent' : ['error', 'limit', 'captcha'].includes(r.result))).slice(0, 40);
+  return <section className={s.card} aria-labelledby="activity-title">
+    <header className={s.heading}><h2 id="activity-title">{c.actions}</h2><Link to="/applied">{en ? 'History' : 'История'}<Icon name="chevron-right" size={13} /></Link></header>
+    <div className={s.filters} role="group" aria-label={c.actions}>
+      {(['all', 'sent', 'issues'] as const).map((key) => <button key={key} aria-pressed={filter === key} onClick={() => setFilter(key)}>{c[key]}</button>)}
+    </div>
+    <div className={s.list}>
+      {!rows.length && <div className={s.none}><Icon name="inbox" size={22} /><p>{list.length ? c.noMatches : c.noActions}</p></div>}
+      {rows.map((r, i) => <article key={[r.id, r.time, r.result, i].join('-')} className={s.item}>
+        <div className={s.row1}>
+          <time dateTime={/^\d{4}-/.test(r.time) ? r.time : undefined}>{eventTime(r.time, en)}</time>
+          <span className={s.acc}>{stripEmoji(alias(r.account_name || r.acc))}</span>
+          <span className={[s.result, r.result === 'sent' ? s.ok : ['error', 'limit', 'captcha'].includes(r.result) ? s.bad : s.warn].join(' ')} title={labels[r.result] || r.result}>
+            <Icon name={r.result === 'sent' ? 'check' : r.result === 'test' ? 'flask-conical' : r.result === 'already' ? 'clock' : 'triangle-alert'} size={12} />{r.result !== 'sent' && (labels[r.result] || r.result)}
+          </span>
+        </div>
+        {/^\d+$/.test(r.id) ? <a className={s.vac} href={'https://hh.ru/vacancy/' + r.id} target="_blank" rel="noopener noreferrer" aria-label={c.open + ': ' + (r.title || r.id)}>{r.title || c.vacancy + ' №' + r.id}<Icon name="external-link" size={12} /></a> : <div className={s.vac}>{r.title || c.vacancy}</div>}
+        {r.company && <div className={s.meta}>{r.company}{r.salary ? ' · ' + r.salary : ''}</div>}
+        {r.result === 'error' && <details className={s.failure}><summary>{en ? 'Why it was not confirmed' : 'Почему отправка не подтверждена'}</summary><p>{applyErrorReason(r.error_detail?.reason, en)}</p>{r.error_detail?.http_status && <small>HTTP {r.error_detail.http_status}</small>}{r.error_detail?.error_code && <small> · {r.error_detail.error_code}</small>}<p><a href="https://hh.ru/applicant/negotiations" target="_blank" rel="noopener noreferrer">{en ? 'Check applications on HH' : 'Проверить отклики на HH'}</a></p></details>}
+      </article>)}
+    </div>
+    <p className={s.zone}>{en ? 'Up to 40 recent events. Open History for all saved applications.' : 'До 40 последних событий. Все сохранённые отклики — в истории.'}</p>
+  </section>;
 }

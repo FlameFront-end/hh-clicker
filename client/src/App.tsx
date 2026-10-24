@@ -12,6 +12,7 @@ import { useShortcuts } from '@/lib/useShortcuts';
 import { useDocumentStatus } from '@/lib/useDocumentStatus';
 import { ROUTES } from './routes';
 import styles from './App.module.css';
+import { UnsavedGuard } from '@/lib/unsaved';
 
 export function App() {
   useEffect(() => startSocket(), []);
@@ -20,6 +21,7 @@ export function App() {
   useDocumentStatus();
   return (
     <TipProvider>
+    <UnsavedGuard />
     <div className={styles.app}>
       <Header />
       <Tabs />

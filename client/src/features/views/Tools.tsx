@@ -1,5 +1,7 @@
 import { useState } from 'react';
 import { get, post } from '@/lib/api';
+import { useApp } from '@/store/app';
+import { Empty } from '@/ui/Kit';
 import { safeHref } from '@/lib/safe';
 import s from '@/ui/Ui.module.css';
 import v from './Views.module.css';
@@ -24,7 +26,17 @@ export function HotLeads({ idx }: { idx: string }) {
 }
 
 export function HrContacts() {
+  const accs = useApp((x) => x.snapshot?.accounts) ?? [];
+  const hasWeb = accs.some((a) => !['mobile', 'oauth'].includes(String(a.mode || '').toLowerCase()));
   const l = useLoader(() => get<Json>('/api/hr_contacts'), 'hr');
+  if (!hasWeb) {
+    return (
+      <div className={v.unavailable}>
+        <Empty icon="contact" title="Контакты HR недоступны для ваших профилей"
+          hint="Контакты берутся из формы отклика на сайте hh.ru. Все ваши профили работают через мобильное API, где HH их не отдаёт. Появятся, если добавить профиль по браузерной сессии." />
+      </div>
+    );
+  }
   const rows: Json[] = (l.data?.contacts ?? []).slice().reverse();
   return (
     <Section icon="contact" title="Контакты HR" desc="Собираются автоматически при откликах"
@@ -45,19 +57,6 @@ export function HrContacts() {
           </table>
         </div>
       )}
-    </Section>
-  );
-}
-
-export function Remindable({ idx }: { idx: string }) {
-  const l = useLoader(() => get<Json>(`/api/account/${idx}/remindable`), idx || undefined);
-  const items: Json[] = l.data?.remindable ?? [];
-  return (
-    <Section icon="bell" title="Можно напомнить" desc="Переговоры, где можно отправить напоминание работодателю"
-      actions={<button className={s.btn} disabled={l.busy || !idx} onClick={l.run}>Обновить</button>}
-      status={l.busy ? 'Проверяю…' : l.data ? `${l.data.total ?? 0} переговоров` : <Err text={l.err} />}>
-      {l.data && !items.length && <span className={s.dim}>Нет переговоров, где можно отправить напоминание.</span>}
-      {items.map((it, i) => <Item key={i} title={it.employer || '?'} sub={it.vacancy} />)}
     </Section>
   );
 }

@@ -9,6 +9,7 @@ import { useSort } from '@/ui/useSort';
 import { downloadCsv } from '@/ui/csv';
 import { AccChip, CheckPill, Empty, JobCell, PageHead, Search, Skeleton, Stats } from '@/ui/Kit';
 import s from '@/ui/Ui.module.css';
+import { eventTime } from '@/features/main/metrics';
 
 interface Applied { at: string; account: string; vacancy_id: string; title: string; company: string; salary_from: number | null; salary_to: number | null; url: string }
 const PAGE = 100;
@@ -20,7 +21,8 @@ export function AppliedTab() {
   const t = useT();
   const names = useApp((x) => x.snapshot?.accounts);
   const alias = useAliasOf();
-  const { data, error, loading, reload } = useFetch<Applied[]>('/api/applied', { limit: 2000 });
+  const { data, error, loading, reload, updatedAt } = useFetch<Applied[]>('/api/applied', { limit: 2000 }, 15000);
+  const dashboard = useApp((x) => x.snapshot?.dashboard);
   const [q, setQ] = useState('');
   const [acc, setAcc] = useState('');
   const [named, setNamed] = useState(false);
@@ -37,9 +39,7 @@ export function AppliedTab() {
   }, [items, q, acc, named, sort]);
 
   const stats = useMemo(() => {
-    const today = new Date().toDateString();
     return {
-      today: items.filter((i) => new Date(i.at).toDateString() === today).length,
       salary: items.filter((i) => i.salary_from || i.salary_to).length,
       companies: new Set(items.map((i) => i.company).filter(Boolean)).size,
     };
@@ -54,14 +54,14 @@ export function AppliedTab() {
 
   return (
     <div className={s.page}>
-      <PageHead title={t('applied_title')} count={rows.length.toLocaleString('ru')} sub="Все вакансии, на которые бот отправил отклик.">
+      <PageHead title={t('applied_title')} count={rows.length.toLocaleString('ru')} sub="Сохранённая история · автообновление каждые 15 секунд · сутки по Москве.">
         <button className={s.btn} onClick={() => downloadCsv('applied.csv', ['Дата', 'Аккаунт', 'Вакансия', 'Компания', 'Зарплата', 'URL'], rows.map((i) => [i.at, i.account, i.title, i.company, sal(i), i.url]))} disabled={!rows.length}><Icon name="arrow-down" size={13} />Скачать CSV</button>
         <button className={s.btn} onClick={() => void reload()} disabled={loading}><Icon name="refresh-cw" size={13} />Обновить</button>
       </PageHead>
       {data && items.length > 0 && (
         <Stats items={[
           { label: 'всего откликов', value: items.length.toLocaleString('ru') },
-          { label: 'сегодня', value: stats.today, tone: stats.today ? 'ok' : undefined },
+          { label: 'сегодня · Москва', value: dashboard?.today ?? '—', tone: dashboard?.today ? 'ok' : undefined },
           { label: 'с указанной зарплатой', value: stats.salary.toLocaleString('ru') },
           { label: 'разных компаний', value: stats.companies.toLocaleString('ru') },
         ]} />
@@ -74,7 +74,9 @@ export function AppliedTab() {
         </Select>
         <CheckPill checked={named} onChange={setNamed}>{t('applied_only_named')}</CheckPill>
       </div>
-      {error && <Empty icon="triangle-alert" title="Не удалось загрузить отклики" hint={error}><button className={s.btn} onClick={() => void reload()}>Повторить</button></Empty>}
+      {updatedAt && <p role="status" className={s.dim}>{error ? 'Не удалось обновить. Показаны прежние данные.' : loading ? 'Обновляю…' : 'Обновлено'} · {eventTime(updatedAt)}</p>}
+      {items.length >= 2000 && <p className={s.dim}>Показаны последние 2000 записей. CSV содержит только загруженные записи с выбранными фильтрами.</p>}
+      {error && !data && <Empty icon="triangle-alert" title="Не удалось загрузить отклики" hint={error}><button className={s.btn} onClick={() => void reload()}>Повторить</button></Empty>}
       {!error && !data && <Skeleton />}
       {data && rows.length === 0 && <Empty icon="check" title={items.length ? 'Ничего не найдено' : 'Откликов пока не было'} hint={items.length ? 'Измените поиск или фильтры.' : 'Когда бот откликнется на вакансию, она появится здесь.'} />}
       {data && rows.length > 0 && <SortTable cols={cols} rows={rows.slice(0, shown)} sort={sort} onSort={onSort} rowKey={(i, n) => `${i.vacancy_id}-${i.at}-${n}`} />}
