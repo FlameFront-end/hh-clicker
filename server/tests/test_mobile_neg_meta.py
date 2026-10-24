@@ -7,6 +7,12 @@ from app import oauth
 from app.hh_mobile_transport import MOBILE_BASE, MobileAPIError
 from app.mobile_neg_meta import fetch_negotiations_metadata, fetch_possible_offers
 
+
+def _base(offers):
+    """Базовые поля контракта (id-поля проверяются отдельным тестом)."""
+    return [{"name": o["name"], "vacancyNames": o["vacancyNames"]} for o in offers]
+
+
 ACC = {"name": "a1", "cookies": {}, "resume_hash": "rh1"}
 
 
@@ -84,7 +90,7 @@ def test_possible_offers_200_list_response(monkeypatch):
                          "vacancies": [{"id": "1", "name": "Инженер"},
                                        {"id": "2", "name": "Тестировщик"}]}],
                   status=200)
-    assert fetch_possible_offers(ACC) == [
+    assert _base(fetch_possible_offers(ACC)) == [
         {"name": "Ромашка", "vacancyNames": ["Инженер", "Тестировщик"]},
     ]
 
@@ -99,7 +105,7 @@ def test_possible_offers_200_dict_items_response(monkeypatch):
                       # вариант с одиночным vacancy вместо списка vacancies
                       {"name": "ИП Иванов", "vacancy": {"name": "Курьер"}},
                   ]}, status=200)
-    assert fetch_possible_offers(ACC) == [
+    assert _base(fetch_possible_offers(ACC)) == [
         {"name": "ООО Вектор", "vacancyNames": ["Разработчик"]},
         {"name": "ИП Иванов", "vacancyNames": ["Курьер"]},
     ]
@@ -110,7 +116,7 @@ def test_possible_offers_404_returns_empty(monkeypatch):
     monkeypatch.setattr(oauth, "_obtain_oauth_token", lambda a: "t")
     responses.add(responses.GET, MOBILE_BASE + "/vacancies/possible_job_offers",
                   json={"errors": [{"value": "not_found"}]}, status=404)
-    assert fetch_possible_offers(ACC) == []
+    assert _base(fetch_possible_offers(ACC)) == []
 
 
 @responses.activate
@@ -121,3 +127,16 @@ def test_possible_offers_401_raises(monkeypatch):
     with pytest.raises(MobileAPIError) as ei:
         fetch_possible_offers(ACC)
     assert ei.value.status_code == 401
+
+
+def test_possible_offers_include_vacancy_ids(monkeypatch):
+    monkeypatch.setattr(
+        "app.mobile_neg_meta.mobile_request",
+        lambda acc, method, path, **kw: {"items": [
+            {"name": "ACME", "id": 7, "vacancies": [{"id": 11, "name": "Dev"}, {"id": 12, "name": "QA"}]},
+        ]},
+    )
+    [offer] = fetch_possible_offers(ACC)
+    assert offer["vacancyIds"] == ["11", "12"]
+    assert offer["vacancyId"] == "11"
+    assert offer["employerId"] == "7"

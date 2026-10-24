@@ -178,6 +178,16 @@ def test_async_fallback_status_retries_web():
     assert web.calls == [("submit_response", ("v1", 500), {})]
 
 
+@pytest.mark.parametrize("method", ["submit_response", "fill_questionnaire"])
+@pytest.mark.parametrize("status", [0, 502, 504])
+def test_async_uncertain_submission_requires_review_not_web_retry(method, status):
+    def boom(*args, **kwargs): raise MobileAPIError(status, url="/m")
+    client, _, web = _client(mobile_behaviors={method: boom})
+    result, info = _run_coro(getattr(client, method)("v1"))
+    assert result == "error" and info["review_required"]
+    assert not web.calls
+
+
 # ── Делегирование: НЕ fallback-статус → перекидываем, web не трогаем ────────
 
 

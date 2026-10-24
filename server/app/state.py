@@ -26,6 +26,14 @@ class AccountState:
 
         self.status = "idle"
         self.status_detail = ""
+        # Only ordinary inter-cycle waits may be interrupted by the dashboard.
+        self._cycle_wakeup = threading.Event()
+        self.cycle_waiting = False
+        self.next_search_at = ""
+        self.last_search_at = ""
+        self.cycle_summary = {}
+        self.seen_tests = set()
+        self.seen_already = set()
 
         self.sent = 0
         self.tests = 0
@@ -72,7 +80,8 @@ class AccountState:
             pass
         self.hard_stopped = False  # жёсткая остановка (лимит или daily)
 
-        self.resume_touch_enabled = True
+        # Тумблеры профиля сохраняются в данных аккаунта и переживают перезапуск.
+        self.resume_touch_enabled = bool(acc_data.get("resume_touch_enabled", True))
         # Startup jitter: первый touch отсрочен на 0-120s, чтобы 100 аккаунтов
         # не ударили hh.ru/oauth/token одновременно (kimi-r13-2 #7, r13-3 #10).
         self.next_resume_touch = datetime.now() + timedelta(seconds=random.uniform(0, 120))
@@ -127,6 +136,8 @@ class AccountState:
 
         # Per-account event log (last 8 events shown on card)
         self.acc_event_log: deque = deque(maxlen=8)
+        # Keep failed submissions independently of the short activity feed.
+        self.apply_errors: deque = deque(maxlen=50)
         # Skip vacancies that require tests
         self.apply_tests: bool = bool(acc_data.get("apply_tests", False))
         self.safety_enabled: bool = bool(
@@ -184,7 +195,7 @@ class AccountState:
         self._llm_neg_failures: dict = {}    # {neg_id: count} — exception-counter for exponential backoff
         self.hh_interview_neg_ids: list = [] # negotiation IDs from last INTERVIEW fetch
         self.hh_discard_neg_ids: set = set() # negotiation IDs HH marked as DISCARD — пропускаем в LLM до вызова API
-        self.llm_enabled: bool = True        # per-account LLM toggle (overridden by global CONFIG.llm_enabled)
+        self.llm_enabled: bool = bool(acc_data.get("llm_enabled", True))  # per-account LLM toggle (overridden by global CONFIG.llm_enabled)
         self.llm_status: str = ""            # human-readable LLM status for dashboard display
         self.llm_replied_count: int = 0      # total replies sent this session
         self.llm_pending_chats: int = 0      # chats awaiting reply (from last scan)
@@ -213,8 +224,16 @@ class AccountState:
         # мог найти его без знания о AccountState.
         self.acc["_cookies_lock"] = self._cookies_lock
         # Reason for pause — manual vs auto vs limit — чтобы midnight reset не сбрасывал manual pause.
-        self.paused_reason: str = ""  # "", "manual", "auto_errors", "limit", "captcha"
+        self.paused_reason: str = ""  # "", "manual", "auto_errors", "limit", "captcha", "auth", "review"
         self.captcha_url: str = ""
+        # Ручная пауза профиля сохраняется (acc["paused"]) — после перезапуска
+        # контейнера профиль не начинает откликаться сам.
+        if acc_data.get("paused"):
+            self.paused = True
+            saved_reason = acc_data.get("paused_reason")
+            self.paused_reason = saved_reason if saved_reason in ("manual", "captcha", "auth", "review", "auto_errors") else "manual"
+            if self.paused_reason == "captcha":
+                self.captcha_url = str(acc_data.get("captcha_url") or "")
 
     def reset_vacancy_meta(self):
         """Clear vacancy_meta before each collection cycle to prevent unbounded growth."""

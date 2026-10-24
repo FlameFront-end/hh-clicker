@@ -3,6 +3,7 @@ BotManager — core bot logic with per-account worker threads.
 """
 
 import asyncio
+import copy
 import aiohttp
 import json
 import random
@@ -12,6 +13,7 @@ from pathlib import Path
 import time
 import threading
 import requests
+import re
 import urllib.parse
 from app.hh_http import HH
 from app.user_agent import mobile_user_agent, webview_user_agent
@@ -22,6 +24,85 @@ except Exception:
     _MSK = None  # fallback на local
 
 from app.logging_utils import log_debug, log_exception, _is_login_page
+from app.dispatch import MessageSendUncertain
+from app.hh_mobile_transport import MobileAPIError
+
+
+_LEVEL_KEYWORDS = {"senior", "lead", "сеньор", "сениор", "лид", "тимлид", "teamlead", "team lead"}
+
+
+def _title_allowed(title: str, include: list, exclude: list, experience: list,
+                   role_include: list | None = None) -> bool:
+    """Profession is mandatory; experience may replace seniority, never the profession."""
+    title = title.lower()
+    include = [str(k).strip().lower() for k in include if str(k).strip()]
+    exclude = [str(k).strip().lower() for k in exclude if str(k).strip()]
+    # Explicit exclusions always win, including Fullstack/NestJS titles.
+    if any(k in title for k in exclude):
+        return False
+    roles = [k for k in include if k not in _LEVEL_KEYWORDS]
+    levels = [k for k in include if k in _LEVEL_KEYWORDS]
+    if not roles and levels:
+        # Existing senior profiles store level words per resume and profession
+        # words on the account. Both constraints must survive that override.
+        roles = [str(k).strip().lower() for k in (role_include or [])
+                 if str(k).strip().lower() not in _LEVEL_KEYWORDS and str(k).strip()]
+    frontend_markers = ("frontend", "front-end", "front end", "фронтенд", "фронтэнд", "react", "next.js", "nextjs")
+    frontend_roles = [k for k in roles if any(marker in k for marker in frontend_markers)]
+    if frontend_roles:
+        # TS/NestJS alone do not establish a frontend role (pure backend uses
+        # them too). Preserve broad stacks without accepting another profession.
+        roles = frontend_roles
+    if roles and not any(k in title for k in roles):
+        return False
+    if levels and not any(k in title for k in levels):
+        return bool(roles and "moreThan6" in experience)
+    return not include or bool(roles or any(k in title for k in levels))
+
+
+def _experience_ids(value) -> list[str]:
+    if isinstance(value, dict):
+        value = value.get("id")
+    if isinstance(value, str):
+        return [value] if value else []
+    return []
+
+
+def _experience_allowed(acc: dict, meta: dict, vid: str, allowed: list) -> bool:
+    if not allowed:
+        return True
+    actual = _experience_ids(meta.get("experience")) or list(meta.get("experience_filters") or [])
+    if not actual:
+        details = fetch_vacancy_details(acc, vid)
+        actual = _experience_ids((details or {}).get("experience"))
+        if actual:
+            meta["experience"] = actual[0]
+    return bool(set(actual).intersection(allowed))
+
+
+def _apply_context_key(acc: dict) -> str:
+    """Only dispatch-affecting settings, not mutable cookies/locks/counters."""
+    keys = ("resume_hash", "resume_filters", "urls", "title_include_keywords",
+            "title_exclude_keywords", "employer_exclude_keywords", "letter", "apply_tests",
+            "search_source_mode", "include_saved_searches")
+    global_keys = ("min_salary", "allowed_schedules", "title_include_keywords",
+                   "title_exclude_keywords", "employer_exclude_keywords", "auto_apply_tests",
+                   "search_period_days", "skip_auto_response_vacancies", "accredited_it_only",
+                   "min_employer_rating", "min_recommendations_percent", "min_employer_reviews",
+                   "url_pool", "filter_agencies", "filter_low_competition")
+    return json.dumps({"account": {k: acc.get(k) for k in keys},
+                       "global": {k: getattr(CONFIG, k, None) for k in global_keys}},
+                      sort_keys=True, default=str)
+
+
+def _search_urls(acc: dict) -> list:
+    if "_cycle_search_urls" in acc:
+        return list(acc["_cycle_search_urls"])
+    if acc.get("search_source_mode") == "selected":
+        return list(acc.get("urls") or [])
+    if acc.get("search_source_mode") == "inherit":
+        return [_url_entry(u)["url"] for u in CONFIG.url_pool]
+    return list(acc.get("urls") or [_url_entry(u)["url"] for u in CONFIG.url_pool])
 
 
 def parse_search_url(url: str) -> tuple[str, int | str, dict]:
@@ -106,9 +187,68 @@ def _mobile_search_filters(filters: dict) -> dict:
         period = int(CONFIG.search_period_days)
     except (TypeError, ValueError):
         period = 0
+    # Mobile API понимает только 1/3/7 дней. Остальные значения (14, 30)
+    # применяются локально по дате публикации — см. _too_old_for_period.
     if period in (1, 3, 7):
         result.setdefault("period", period)
+    # Те же метки, что и web-поиск: HH принимает одну метку, приоритет у
+    # «мало откликов». Раньше mobile-профили эти переключатели игнорировали.
+    if "label" not in result:
+        if CONFIG.filter_low_competition:
+            result["label"] = "low_performance"
+        elif CONFIG.filter_agencies:
+            result["label"] = "not_from_agency"
     return result
+
+
+# Грубые курсы для фильтра «мин. зарплата» (как в web-парсере hh_api).
+_SALARY_RATES = {
+    "RUR": 1, "RUB": 1, "USD": 90, "EUR": 100, "KZT": 0.18, "BYR": 28, "BYN": 28,
+    "UZS": 0.007, "UAH": 2.2, "AZN": 53, "GEL": 33, "KGS": 1.05,
+}
+
+
+def _salary_rub(sal) -> int | None:
+    """Нижняя граница зарплаты в рублях. None — зарплата не указана или
+    валюта неизвестна (такие вакансии фильтр зарплаты не отбрасывает)."""
+    if not isinstance(sal, dict):
+        return None
+    value = sal.get("from") or sal.get("to")
+    if not value:
+        return None
+    rate = _SALARY_RATES.get(str(sal.get("currency") or "RUR").upper())
+    if rate is None:
+        return None
+    try:
+        return int(float(value) * rate)
+    except (TypeError, ValueError):
+        return None
+
+
+def _too_old_for_period(meta: dict, now: datetime | None = None) -> bool:
+    """Локальный фильтр «свежесть N дней». Нужен для mobile-поиска, где сервер
+    принимает только 1/3/7 дней. Вакансии без даты не отбрасываем."""
+    try:
+        days = int(CONFIG.search_period_days)
+    except (TypeError, ValueError):
+        return False
+    if days <= 0:
+        return False
+    published = _vacancy_published_at(meta)
+    if published is None:
+        return False
+    if now is None:
+        now = datetime.now(published.tzinfo) if published.tzinfo else datetime.now()
+    return (now - published).total_seconds() > days * 86400
+
+
+def _salary_too_low(salary_map: dict, vid: str) -> bool:
+    """Отбрасываем только вакансии с УКАЗАННОЙ зарплатой ниже порога.
+    Раньше без зарплаты = отказ, а это около половины рынка."""
+    if CONFIG.min_salary <= 0:
+        return False
+    sal = salary_map.get(vid)
+    return sal is not None and sal < CONFIG.min_salary
 
 
 def _uses_api_search(acc: dict, state) -> bool:
@@ -204,8 +344,19 @@ def _cap_apply_batch(batch, daily_sent, hh_today_applies):
 
 
 def _completed_apply_results(batch, results):
-    return sorted(zip(batch, results), key=lambda item: not (
-        isinstance(item[1], tuple) and item[1][0] in ('sent', 'already')))
+    # Account for every response already received. Persist receipts first,
+    # then ambiguous writes, then blockers; only afterwards consider starting
+    # a questionnaire (which is a new network write, not result accounting).
+    def priority(item):
+        result = item[1]
+        if isinstance(result, Exception):
+            return 1
+        if result[0] in ("sent", "already"):
+            return 0
+        if result[0] == "error" and (result[1] or {}).get("review_required"):
+            return 1
+        return 3 if result[0] == "test" else 2
+    return sorted(zip(batch, results), key=priority)
 
 
 def _protect_fresh_batch(batch: list, vacancy_meta: dict, *, hours: int,
@@ -259,10 +410,10 @@ from app.config import (
 )
 
 from app.storage import (
-    _load_cache, get_applied_list,
-    add_applied, is_applied, add_test_vacancy, is_test, get_stats,
+    _load_cache, get_applied_list, get_dashboard_metrics,
+    add_applied, is_applied, add_test_vacancy, is_test, is_review_pending, get_stats,
     load_browser_sessions, save_browser_sessions,
-    upsert_interview, get_no_chat_neg_ids, get_replied_keys,
+    upsert_interview, get_no_chat_neg_ids, get_replied_keys, hold_message_for_review, is_message_review_pending,
     _schedule_save,
 )
 
@@ -427,8 +578,11 @@ class BotManager:
             urls.insert(0, default_resume_url)
         return urls
 
-    def activate_session(self, temp_idx: int) -> bool:
-        """Запустить браузерную сессию как полноценный бот-аккаунт."""
+    def activate_session(self, temp_idx: int, restore: bool = False) -> bool:
+        """Запустить браузерную сессию как полноценный бот-аккаунт.
+
+        restore=True — авто-восстановление при старте: сохранённая ручная пауза
+        остаётся в силе. При ручном запуске из UI пауза снимается."""
         with self._activate_lock:
             if temp_idx < 0 or temp_idx >= len(self.temp_sessions):
                 return False
@@ -443,6 +597,10 @@ class BotManager:
                 return False
             if temp_idx in self.temp_states:
                 return True  # уже запущен
+            if not restore:
+                ts["paused"] = False
+                ts["paused_reason"] = ""
+                ts["captcha_url"] = ""
             # Отфильтровываем сохранённые URL от других резюме — юзер мог
             # сменить resume_hash сессии, а ts["urls"] содержит `resume=<старый_hash>`.
             # Без фильтра mobile-collect соберёт вакансии по чужому фильтру,
@@ -477,7 +635,13 @@ class BotManager:
                 "apply_tests": bool(ts.get("apply_tests", False)),
                 "safety_enabled": bool(ts.get("safety_enabled", CONFIG.skip_inconsistent)),
                 "mode": ts.get("mode", "web"),
+                "user_id": str(ts.get("user_id") or ""),
                 "resume_filters": normalize_resume_filters(ts.get("resume_filters")),
+                "paused": bool(ts.get("paused", False)),
+                "paused_reason": ts.get("paused_reason", ""),
+                "captcha_url": ts.get("captcha_url", ""),
+                "llm_enabled": bool(ts.get("llm_enabled", True)),
+                "resume_touch_enabled": bool(ts.get("resume_touch_enabled", True)),
             }
             for filter_key in (
                 "title_include_keywords",
@@ -567,10 +731,11 @@ class BotManager:
         return None
 
     def _get_apply_state(self, idx: int):
-        """Вернуть AccountState или None для temp-сессий"""
+        """AccountState обычного профиля или запущенной браузерной сессии
+        (раньше для браузерных — None, и ручные отклики не попадали в счётчики)."""
         if 0 <= idx < len(self.account_states):
             return self.account_states[idx]
-        return None
+        return self.temp_states.get(idx - len(self.account_states))
 
     def _start_ws_push(self, state) -> None:
         """Подписать аккаунт на chatik WS push.
@@ -680,6 +845,7 @@ class BotManager:
         except Exception as _e:
             log_debug(f"applying stored proxy failed: {_e}")
         self._start_time = datetime.now()
+        self.paused = bool(getattr(CONFIG, "bot_paused", False))
         self._restore_recent_responses()
         self.account_states = [AccountState(acc) for acc in accounts_data]
         for i, state in enumerate(self.account_states):
@@ -702,6 +868,8 @@ class BotManager:
             try:
                 from app.ws_manager import ws_manager
                 ws_manager.auto_start_enabled()
+                if self.paused:
+                    ws_manager.suspend()
             except Exception as e:
                 log_debug(f"ws_manager auto_start error: {e}")
         # Proactive OAuth refresh — раз в 6 часов обновляет токены,
@@ -728,9 +896,9 @@ class BotManager:
         for i, ts in enumerate(self.temp_sessions):
             log_debug(f"start(): session {i}: bot_active={ts.get('bot_active')}, resume_hash={bool(ts.get('resume_hash'))}")
             if ts.get("bot_active") and ts.get("resume_hash"):
-                ts["paused"] = False  # Reset pause on startup
                 try:
-                    result = self.activate_session(i)
+                    # Ручная пауза профиля сохраняется между перезапусками.
+                    result = self.activate_session(i, restore=True)
                     log_debug(f"start(): activate_session({i}) = {result}")
                 except Exception as e:
                     log_debug(f"start(): activate_session({i}) ERROR: {e}")
@@ -769,6 +937,8 @@ class BotManager:
 
     def toggle_pause(self):
         self.paused = not self.paused
+        CONFIG.bot_paused = self.paused
+        save_config()
         msg = "⏸️ Пауза" if self.paused else "▶️ Продолжение"
         level = "warning" if self.paused else "success"
         self._add_log("", "", msg, level)
@@ -781,6 +951,44 @@ class BotManager:
                 ws_manager.resume()
         except Exception:
             pass
+
+    def _persist_account_flag(self, idx: int, key: str, value) -> None:
+        """Сохранить тумблер профиля (обычного или браузерного) на диск."""
+        try:
+            if 0 <= idx < len(self.account_states):
+                self.account_states[idx].acc[key] = value
+                if idx < len(accounts_data):
+                    accounts_data[idx][key] = value
+                    save_accounts()
+                return
+            temp_idx = idx - len(self.account_states)
+            state = self.temp_states.get(temp_idx)
+            if state is not None:
+                state.acc[key] = value
+            if 0 <= temp_idx < len(self.temp_sessions):
+                self.temp_sessions[temp_idx][key] = value
+                save_browser_sessions(self.temp_sessions)
+        except Exception as e:
+            log_debug(f"persist {key} [{idx}]: {e}")
+
+    def _persist_protective_pause(self, state: AccountState) -> None:
+        flags = {"paused": bool(state.paused), "paused_reason": state.paused_reason,
+                 "captcha_url": state.captcha_url}
+        state.acc.update(flags)
+        try:
+            for i, st in enumerate(getattr(self, "account_states", [])):
+                if st is state:
+                    if i < len(accounts_data):
+                        accounts_data[i].update(flags)
+                        save_accounts()
+                    return
+            for i, st in getattr(self, "temp_states", {}).items():
+                if st is state and i < len(self.temp_sessions):
+                    self.temp_sessions[i].update(flags)
+                    save_browser_sessions(self.temp_sessions)
+                    return
+        except Exception as exc:
+            log_debug(f"persist protective pause [{state.short}]: {type(exc).__name__}")
 
     def toggle_account_pause(self, idx: int):
         state = None
@@ -804,6 +1012,7 @@ class BotManager:
                 state.captcha_url = ""
             else:
                 state.paused_reason = "manual"
+        self._persist_protective_pause(state)
         msg = (
             f"⏸️ Аккаунт {state.short} приостановлен"
             if state.paused
@@ -831,6 +1040,7 @@ class BotManager:
             state = self.temp_states.get(temp_idx)
         if state:
             state.llm_enabled = not state.llm_enabled
+            self._persist_account_flag(idx, "llm_enabled", state.llm_enabled)
             msg = (
                 f"\U0001f916 LLM включён для {state.short}"
                 if state.llm_enabled
@@ -878,12 +1088,13 @@ class BotManager:
                 state = self.temp_states[temp_idx]
         if state:
             state.resume_touch_enabled = not state.resume_touch_enabled
+            self._persist_account_flag(idx, "resume_touch_enabled", state.resume_touch_enabled)
             return state.resume_touch_enabled
         return False
 
     def _add_log(self, acc_short: str, acc_color: str, message: str, level: str = "info", neg_id: str = ""):
         entry = {
-            "time": datetime.now().strftime("%H:%M:%S"),
+            "time": datetime.now().astimezone().isoformat(timespec="seconds"),
             "acc": acc_short,
             "color": acc_color,
             "message": message,
@@ -893,6 +1104,23 @@ class BotManager:
             entry["neg_id"] = str(neg_id)
         with self._deque_lock:
             self.activity_log.appendleft(entry)
+
+    def _record_apply_error(self, state: AccountState, vid: str, reason: str, info: dict | None = None):
+        meta = state.vacancy_meta.get(vid, {})
+        info = info or {}
+        # Never retain raw responses, exception messages or credentials here.
+        status = info.get("http_status")
+        code = str(info.get("error_code") or "")
+        with state._deque_lock:
+            state.errors += 1
+            state.apply_errors.appendleft({
+                "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "vacancy_id": vid if str(vid).isdigit() else "",
+                "title": str(meta.get("title") or "")[:160],
+                "reason": reason,
+                "http_status": status if isinstance(status, int) and 100 <= status <= 599 else None,
+                "error_code": code if re.fullmatch(r"[a-z_]{1,40}", code) else "",
+            })
 
     def _add_acc_event(self, state: AccountState, icon: str, etype: str,
                         title: str, company: str, extra: str = ""):
@@ -942,6 +1170,7 @@ class BotManager:
                 if state.consecutive_errors >= n and not state.paused:
                     state.paused = True
                     state.paused_reason = "auto_errors"
+                    self._persist_protective_pause(state)
                     self._add_log(
                         state.short, state.color,
                         f"⛔ Авто-пауза: {n} ошибок подряд. Снимите вручную.",
@@ -971,10 +1200,17 @@ class BotManager:
 
     def _restore_recent_responses(self):
         """Hydrate history via storage API, never an imported cache reference."""
+        # В хранилище профиль записан полным именем, а живые записи ленты —
+        # коротким. Приводим к одному виду, чтобы лента после рестарта не «двоилась».
+        short_by_name = {}
+        for acc in list(accounts_data) + list(self.temp_sessions):
+            if isinstance(acc, dict) and acc.get("name"):
+                short_by_name[acc["name"]] = acc.get("short") or acc["name"]
         entries = [{
             "id": row["vacancy_id"], "title": row.get("title", ""),
-            "company": row.get("company", ""), "acc": row["account"],
-            "time": (row.get("at") or "")[:16].replace("T", " "),
+            "company": row.get("company", ""), "acc": short_by_name.get(row["account"], row["account"]),
+            "account_name": row["account"],
+            "time": row.get("at") or "",
             "result": "sent", "icon": "✅",
         } for row in get_applied_list(100)]
         with self._deque_lock:
@@ -1001,12 +1237,13 @@ class BotManager:
         # фронт показывает их в карточке отклика без extra-fetch'ей.
         _vm = state.vacancy_meta.get(vid, {}) if hasattr(state, "vacancy_meta") else {}
         entry = {
-            "time": datetime.now().strftime("%H:%M:%S"),
+            "time": datetime.now().astimezone().isoformat(timespec="seconds"),
             "acc": state.short,
             "color": state.color,
             "id": vid,
-            "title": title,
-            "company": company,
+            "account_name": state.name,
+            "title": title or _vm.get("title") or f"Вакансия №{vid}",
+            "company": company or _vm.get("company") or "",
             "salary": salary,
             "result": result,
             "icon": result_icons.get(result, "❓"),
@@ -1015,10 +1252,19 @@ class BotManager:
             "accept_auto": _vm.get("accept_auto_response"),
             "employer_rating": _vm.get("employer_rating") or None,
         }
+        if result == "error":
+            with state._deque_lock:
+                last_error = next((e for e in getattr(state, "apply_errors", []) if e["vacancy_id"] == str(vid)), None)
+                if last_error:
+                    entry["error_detail"] = dict(last_error)
         # Держим _deque_lock т.к. snap builder читает `list(self.recent_responses)`
         # без lock'а в другом потоке — иначе CPython RuntimeError и дроп тика.
         with self._deque_lock:
             self.recent_responses.appendleft(entry)
+        if result == "test":
+            state.seen_tests.add(vid)
+        elif result == "already":
+            state.seen_already.add(vid)
 
     def get_state_snapshot(self) -> dict:
         """Full JSON snapshot for WS broadcast"""
@@ -1028,6 +1274,7 @@ class BotManager:
         # All states: regular + temp sessions (for global_stats, vacancy_queues)
         all_states = list(self.account_states) + list(self.temp_states.values())
         storage_stats = get_stats()
+        metrics = get_dashboard_metrics()
 
         accounts = []
         for i, s in enumerate(self.account_states):
@@ -1077,6 +1324,7 @@ class BotManager:
                 "color": s.color,
                 "status": _status,
                 "status_detail": _status_detail,
+                "can_run_now": not self._run_now_error(s),
                 "sent": _total_applied,
                 "session_sent": s.sent,
                 "total_applied": _total_applied,
@@ -1119,6 +1367,7 @@ class BotManager:
                 "resume_global_invitations": s.resume_global_invitations,
                 "resume_new_invitations_total": s.resume_new_invitations_total,
                 "acc_event_log": self._snap_deque(s.acc_event_log, s._deque_lock),
+                "apply_errors": self._snap_deque(s.apply_errors, s._deque_lock),
                 "apply_tests": s.apply_tests,
                 "safety_enabled": s.safety_enabled,
                 "safety_inconsistent_skipped": s.safety_inconsistent_skipped,
@@ -1131,6 +1380,7 @@ class BotManager:
                 "degraded_mode": s.degraded_mode,
                 "degraded_skipped": s.degraded_skipped,
                 "mode": str(s.acc.get("mode", "") or "").strip().lower(),
+                "hh_user_id": str(s.acc.get("user_id") or ""),
                 "degraded_fallback_enabled": s.degraded_fallback_enabled,
                 "resume_status_oauth": dict(s.resume_status or {}),
                 "hh_today_applies": s.hh_today_applies,
@@ -1208,6 +1458,7 @@ class BotManager:
                     "url_pages": s.acc.get("url_pages", {}),
                     "status": _status,
                     "status_detail": _status_detail,
+                    "can_run_now": not self._run_now_error(s),
                     "sent": _total_applied,
                     "session_sent": s.sent,
                     "total_applied": _total_applied,
@@ -1247,6 +1498,7 @@ class BotManager:
                     "resume_global_invitations": s.resume_global_invitations,
                     "resume_new_invitations_total": s.resume_new_invitations_total,
                     "acc_event_log": self._snap_deque(s.acc_event_log, s._deque_lock),
+                    "apply_errors": self._snap_deque(s.apply_errors, s._deque_lock),
                     "apply_tests": s.apply_tests,
                     "safety_enabled": s.safety_enabled,
                     "safety_inconsistent_skipped": s.safety_inconsistent_skipped,
@@ -1260,6 +1512,7 @@ class BotManager:
                     "degraded_skipped": s.degraded_skipped,
                     "degraded_fallback_enabled": s.degraded_fallback_enabled,
                     "mode": str(s.acc.get("mode", "") or "").strip().lower(),
+                    "hh_user_id": str(s.acc.get("user_id") or ""),
                     "resume_status_oauth": dict(s.resume_status or {}),
                     "hh_today_applies": s.hh_today_applies,
                     "hh_today_applies_updated": s.hh_today_applies_updated,
@@ -1292,6 +1545,8 @@ class BotManager:
                     "color": "yellow",
                     "temp": True,
                     "bot_active": False,
+                    "mode": str(ts.get("mode", "") or "").strip().lower(),
+                    "hh_user_id": str(ts.get("user_id") or ""),
                     "resume_hash": ts.get("resume_hash", ""),
                     "all_resumes": ts.get("all_resumes", []),
                     "resume_filters": normalize_resume_filters(ts.get("resume_filters")),
@@ -1337,7 +1592,7 @@ class BotManager:
                     "hh_daily_limit": CONFIG.hh_daily_limit or 200,
                     "responses_streak_count": 0,
                     "responses_streak_required": 0,
-                    "llm_enabled": True,
+                    "llm_enabled": bool(ts.get("llm_enabled", True)),
                     "use_oauth": bool(ts.get("use_oauth", False)),
                     "daily_sent": 0,
                     "daily_limit": CONFIG.daily_apply_limit,
@@ -1356,8 +1611,36 @@ class BotManager:
                 else [],
             }
 
+        state_by_idx = {i: s for i, s in enumerate(self.account_states)}
+        state_by_idx.update({len(self.account_states) + i: s for i, s in self.temp_states.items()})
+        for item in accounts:
+            st = state_by_idx.get(item["idx"])
+            raw = st.acc if st else self.temp_sessions[item["idx"] - len(self.account_states)]
+            item["profile_filter_keys"] = [k for k in ("title_include_keywords", "title_exclude_keywords", "employer_exclude_keywords") if isinstance(raw.get(k), list)]
+            item["search_source_mode"] = raw.get("search_source_mode", "selected" if raw.get("urls") else "inherit")
+            item["include_saved_searches"] = raw.get("include_saved_searches", True)
+            item["active_search_urls"] = list(getattr(st, "active_search_urls", [])) if st else []
+            persisted = metrics["by_account"].get(st.name if st else item["name"], {})
+            item.update({
+                "sent_today": persisted.get("today", 0),
+                "last_sent_at": persisted.get("last_sent_at", ""),
+                "unique_tests": len(st.seen_tests) if st else 0,
+                "unique_already": len(st.seen_already) if st else 0,
+                "next_search_at": st.next_search_at if st else "",
+                "last_search_at": st.last_search_at if st else "",
+                "hh_stats_checked_at": st.hh_stats_updated.astimezone().isoformat() if st and st.hh_stats_updated else "",
+                "cycle_summary": dict(st.cycle_summary) if st else {},
+                "effective_oauth": bool(item.get("use_oauth") or CONFIG.use_oauth_apply or item.get("degraded_mode") or item.get("mode") == "oauth"),
+            })
+            raw_updated = item.get("hh_today_applies_updated")
+            if raw_updated:
+                from app.dashboard import timestamp
+                stamp = timestamp(raw_updated)
+                item["hh_today_applies_updated"] = stamp.isoformat() if stamp else ""
+
         return {
             "type": "state_update",
+            "dashboard": {k: v for k, v in metrics.items() if k != "by_account"},
             "uptime_seconds": uptime,
             "paused": self.paused,
             "accounts": accounts,
@@ -1443,6 +1726,57 @@ class BotManager:
             "vacancy_queues": _vacancy_queues,
         }
 
+    def _run_now_error(self, state: AccountState) -> str:
+        if self._stop_event.is_set() or state._deleted:
+            return "Профиль остановлен"
+        if self.paused or state.paused:
+            return "Сначала снимите паузу"
+        if state.captcha_url or state.paused_reason in ("captcha", "auth", "auto_errors"):
+            return "Сначала устраните причину остановки профиля"
+        if (state.hard_stopped or state.limit_exceeded
+                or (CONFIG.daily_apply_limit > 0 and state.daily_sent >= CONFIG.daily_apply_limit)
+                or (CONFIG.hh_daily_limit > 0 and state.hh_today_applies >= CONFIG.hh_daily_limit)):
+            return "Достигнут лимит откликов"
+        if not state.cycle_waiting:
+            return "Проверка уже выполняется или профиль ещё не готов"
+        if state._cycle_wakeup.is_set():
+            return "Проверка уже запрошена"
+        return ""
+
+    def request_account_cycle(self, idx: int) -> dict:
+        """Wake the existing worker; never create a parallel application cycle."""
+        if 0 <= idx < len(self.account_states):
+            state = self.account_states[idx]
+        else:
+            state = self.temp_states.get(idx - len(self.account_states))
+        if state is None:
+            return {"ok": False, "error": "Активный профиль не найден"}
+        with state._state_lock:
+            error = self._run_now_error(state)
+            if error:
+                return {"ok": False, "error": error}
+            state._cycle_wakeup.set()
+        return {"ok": True}
+
+    def _wait_between_cycles(self, state: AccountState, seconds: float) -> bool:
+        """Wait interruptibly, preserving the usual pause/limit checks next cycle."""
+        with state._state_lock:
+            state._cycle_wakeup.clear()
+            state.cycle_waiting = True
+            state.next_search_at = (datetime.now().astimezone() + timedelta(seconds=max(0, seconds))).isoformat()
+        deadline = time.monotonic() + max(0, seconds)
+        try:
+            while not self._stop_event.is_set() and not state._deleted:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or state._cycle_wakeup.wait(min(remaining, 0.5)):
+                    break
+        finally:
+            with state._state_lock:
+                state.cycle_waiting = False
+                state.next_search_at = ""
+                state._cycle_wakeup.clear()
+        return self._stop_event.is_set() or state._deleted
+
     def _run_account_worker(self, idx: int, state: AccountState) -> None:
         """Thread worker for an account — auto-restarts on crash"""
         while not self._stop_event.is_set() and not getattr(state, '_deleted', False):
@@ -1458,6 +1792,170 @@ class BotManager:
                 state.status = "idle"
                 state.status_detail = "Перезапущен после ошибки"
                 self._add_log(state.short, state.color, "\U0001f504 Worker перезапущен", "info")
+
+    def _maybe_touch_resume(self, state: AccountState, acc: dict) -> None:
+        """Автоподнятие резюме. Не зависит от лимита откликов: вызывается и из
+        основного цикла, и пока профиль стоит на паузе из-за лимита/капчи."""
+        now = datetime.now()
+        if state.resume_touch_enabled:
+            should_touch = False
+            if state.next_resume_touch is None:
+                should_touch = True
+            elif now >= state.next_resume_touch:
+                should_touch = True
+
+            if should_touch:
+                # Всегда сверяемся с сервером непосредственно перед publish:
+                # UI/фоновая статистика используют 5-минутный cache и после
+                # предыдущего touch могут ещё показывать устаревшее `true`.
+                fresh_status = get_client(acc).fetch_resume_status(force=True) or {}
+                server_next = _server_next_publish_datetime(fresh_status)
+                if fresh_status and not fresh_status.get("can_publish_or_update"):
+                    state.resume_free_touches = 0
+                    if server_next and server_next > now:
+                        state.next_resume_touch = server_next
+                        state.resume_touch_status = f"⏳ Доступно в {server_next.strftime('%H:%M')}"
+                    else:
+                        # Сервер запретил publish, но не отдал время. Не вызываем
+                        # publish в этом проходе; свежий статус проверится в
+                        # следующем обычном цикле без ложного запроса на поднятие.
+                        state.next_resume_touch = now + timedelta(minutes=5)
+                        state.resume_touch_status = "⏳ HH пока не разрешает поднятие"
+                elif fresh_status.get("can_publish_or_update"):
+                    self._add_log(state.short, state.color, "\U0001f4e4 Поднимаю резюме...", "info")
+                    success, message, touch_cooldown = _normalize_touch_result(
+                        get_client(acc).touch_resume())
+                    # Результат publish немедленно делает прежний cache статуса
+                    # недействительным. Следующее время берём только у HH.
+                    after_status = get_client(acc).fetch_resume_status(force=True) or {}
+                    server_next = _server_next_publish_datetime(after_status)
+                    state.resume_free_touches = int(bool(after_status.get("can_publish_or_update")))
+                    if server_next and server_next > now:
+                        state.next_resume_touch = server_next
+                    else:
+                        # Защита на случай eventual consistency API: повторно
+                        # читаем статус позже, но publish без разрешения не шлём.
+                        state.next_resume_touch = now + timedelta(minutes=5)
+                    if touch_cooldown and touch_cooldown > state.next_resume_touch:
+                        state.next_resume_touch = touch_cooldown
+                    if success:
+                        state.resume_touch_status = "✅ Поднято!"
+                        self._add_log(
+                            state.short, state.color,
+                            f"✅ Резюме поднято! Следующая проверка в {state.next_resume_touch.strftime('%H:%M')}",
+                            "success",
+                        )
+                    else:
+                        state.resume_touch_status = f"⏳ {message}"
+                        self._add_log(
+                            state.short, state.color,
+                            f"\U0001f4e4 {message}. Следующая проверка статуса в {state.next_resume_touch.strftime('%H:%M')}",
+                            "warning",
+                        )
+                else:
+                    # Без подтверждённого разрешения от HH ручку publish не
+                    # вызываем. Сетевая ошибка статуса не должна вести к 429.
+                    state.next_resume_touch = now + timedelta(minutes=5)
+                    state.resume_touch_status = "⏳ Не удалось проверить доступность"
+
+    def _hot_lead_vids(self, acc: dict) -> set:
+        """id вакансий работодателей, готовых пригласить (possible_job_offers).
+        Mobile-профили — через mobile API, web — через web-эндпоинт."""
+        mode = str(acc.get("mode", "")).strip().lower()
+        if mode in ("mobile", "oauth"):
+            vids = set()
+            for o in get_client(acc).fetch_possible_offers() or []:
+                for v in (o.get("vacancyIds") or ([o["vacancyId"]] if o.get("vacancyId") else [])):
+                    vids.add(str(v))
+            return vids
+        r_offers = HH.get(
+            hh_base() + "/shards/applicant/negotiations/possible_job_offers",
+            headers={
+                "User-Agent": webview_user_agent(),
+                "Accept": "application/json",
+                "X-Xsrftoken": acc.get("cookies", {}).get("_xsrf", ""),
+                "Referer": hh_base() + "/applicant/negotiations",
+            },
+            cookies=acc.get("cookies", {}), cookie_jar_key=_token_key(acc) or None,
+            timeout=10,
+        )
+        if r_offers.status_code != 200:
+            return set()
+        offers_data = r_offers.json()
+        offer_items = offers_data if isinstance(offers_data, list) else offers_data.get("possibleJobOffers", [])
+        return {str(o.get("vacancyId")) for o in offer_items if o.get("vacancyId")}
+
+    def _enrich_missing_meta(self, state: AccountState, acc: dict, vids: set,
+                             salary_map: dict, schedule_map: dict, limit: int = 40) -> int:
+        """Заполнить vacancy_meta для вакансий, у которых нет названия
+        (избранное, похожие). Не больше `limit` запросов за цикл."""
+        missing = [v for v in vids if not (state.vacancy_meta.get(v) or {}).get("title")]
+        filled = 0
+        for vid in missing[:limit]:
+            if self._stop_event.is_set() or state._deleted:
+                break
+            try:
+                det = fetch_vacancy_details(acc, vid)
+            except Exception as e:
+                log_debug(f"enrich meta {vid} [{state.short}]: {e}")
+                continue
+            if not det or not det.get("title"):
+                if det.get("archived") if det else False:
+                    state.vacancy_meta.setdefault(vid, {})["archived"] = True
+                continue
+            meta = state.vacancy_meta.setdefault(vid, {})
+            meta.update({
+                "title": det.get("title", ""),
+                "experience": det.get("experience", ""),
+                "company": det.get("company", ""),
+                "employer_id": str(det.get("employer_id") or ""),
+                "published_at": det.get("published_at", ""),
+                "has_test": bool(det.get("has_test")),
+                "response_letter_required": bool(det.get("response_letter_required")),
+                "archived": bool(det.get("archived")),
+            })
+            if det.get("work_format"):
+                meta["work_formats"] = [str(w).upper() for w in det["work_format"] if w]
+            if det.get("schedule"):
+                schedule_map.setdefault(vid, set()).add(det["schedule"])
+            salary_map[vid] = _salary_rub(det.get("salary"))
+            filled += 1
+        if missing:
+            log_debug(f"enrich meta [{state.short}]: {filled}/{len(missing)} карточек дотянуто")
+        return filled
+
+    def _dispatch_allowed(self, state: AccountState, context: str) -> bool:
+        return not (self.paused or self._stop_event.is_set() or state.paused
+                    or state.limit_exceeded or state.hard_stopped or state._deleted
+                    or _apply_context_key(state.acc) != context)
+
+    def _send_oauth_batch(self, state: AccountState, acc: dict, batch: list, context: str) -> list:
+        acc = {**acc, "_dispatch_guard": lambda: self._dispatch_allowed(state, context)}
+        results = []
+        for vid in batch:
+            if not self._dispatch_allowed(state, context):
+                break
+            try:
+                result = _oauth_apply(acc, vid, acc.get("letter", ""))
+                results.append(result)
+                if result[0] in ("captcha", "limit", "auth_error"):
+                    break
+                if result[0] == "error" and result[1].get("review_required"):
+                    break
+            except Exception as exc:
+                results.append(exc)
+            if CONFIG.response_delay > 0:
+                time.sleep(CONFIG.response_delay)
+        return results
+
+    def _hold_unconfirmed_submission(self, state, acc, vid):
+        """Pause and durably hold an ambiguous write before another cycle."""
+        state.paused = True
+        state.paused_reason = "review"
+        self._persist_protective_pause(state)
+        meta = state.vacancy_meta.get(vid, {})
+        add_test_vacancy(vid, meta.get("title", ""), meta.get("company", ""),
+                         acc["name"], acc.get("resume_hash", ""), status="review")
 
     def _run_account_worker_inner(self, idx: int, state: AccountState) -> None:
         acc = state.acc
@@ -1484,7 +1982,7 @@ class BotManager:
                     if self._maybe_roll_daily_counter(state):
                         # Не снимаем manual pause — если юзер сам остановил аккаунт,
                         # midnight-rollover не должен его перезапускать (swarm-12 #8).
-                        if state.paused_reason != "manual":
+                        if state.paused_reason in ("", "limit"):
                             state.paused = False
                             state.paused_reason = ""
                         state.limit_exceeded = False
@@ -1518,75 +2016,32 @@ class BotManager:
                         "captcha": "HH требует проверку при отправке отклика. Пройдите её по ссылке ниже и снимите паузу.",
                         "auto_errors": "Авто-пауза после ошибок отправки. Проверьте журнал.",
                         "auth": "Пауза: требуется авторизация HH.",
+                        "review": "Результат отправки не подтверждён. Проверьте отклик в HH перед продолжением.",
                     }.get(state.paused_reason, "Пауза пользователем")
+                # Лимит/капча/ошибки откликов не мешают поднимать резюме.
+                if (not self.paused and state.paused
+                        and state.paused_reason in ("limit", "captcha", "auto_errors", "review")):
+                    try:
+                        self._maybe_touch_resume(state, acc)
+                    except Exception as e:
+                        log_debug(f"resume touch on pause [{state.short}]: {e}")
                 time.sleep(1)
 
             if self._stop_event.is_set():
                 break
 
+            # Freeze dispatch settings for this cycle. Edits invalidate the
+            # queue; they must never change the resume of a selected vacancy.
+            with state._state_lock:
+                cycle_context = _apply_context_key(state.acc)
+                acc = dict(state.acc)
+                acc["resume_filters"] = copy.deepcopy(state.acc.get("resume_filters"))
+                acc["_dispatch_guard"] = lambda context=cycle_context: self._dispatch_allowed(state, context)
+
             now = datetime.now()
 
             # === АВТОПОДНЯТИЕ РЕЗЮМЕ ===
-            if state.resume_touch_enabled:
-                should_touch = False
-                if state.next_resume_touch is None:
-                    should_touch = True
-                elif now >= state.next_resume_touch:
-                    should_touch = True
-
-                if should_touch:
-                    # Всегда сверяемся с сервером непосредственно перед publish:
-                    # UI/фоновая статистика используют 5-минутный cache и после
-                    # предыдущего touch могут ещё показывать устаревшее `true`.
-                    fresh_status = get_client(acc).fetch_resume_status(force=True)
-                    server_next = _server_next_publish_datetime(fresh_status)
-                    if fresh_status and not fresh_status.get("can_publish_or_update"):
-                        state.resume_free_touches = 0
-                        if server_next and server_next > now:
-                            state.next_resume_touch = server_next
-                            state.resume_touch_status = f"⏳ Доступно в {server_next.strftime('%H:%M')}"
-                        else:
-                            # Сервер запретил publish, но не отдал время. Не вызываем
-                            # publish в этом проходе; свежий статус проверится в
-                            # следующем обычном цикле без ложного запроса на поднятие.
-                            state.next_resume_touch = now + timedelta(minutes=5)
-                            state.resume_touch_status = "⏳ HH пока не разрешает поднятие"
-                    elif fresh_status.get("can_publish_or_update"):
-                        self._add_log(state.short, state.color, "\U0001f4e4 Поднимаю резюме...", "info")
-                        success, message, touch_cooldown = _normalize_touch_result(
-                            get_client(acc).touch_resume())
-                        # Результат publish немедленно делает прежний cache статуса
-                        # недействительным. Следующее время берём только у HH.
-                        after_status = get_client(acc).fetch_resume_status(force=True)
-                        server_next = _server_next_publish_datetime(after_status)
-                        state.resume_free_touches = int(bool(after_status.get("can_publish_or_update")))
-                        if server_next and server_next > now:
-                            state.next_resume_touch = server_next
-                        else:
-                            # Защита на случай eventual consistency API: повторно
-                            # читаем статус позже, но publish без разрешения не шлём.
-                            state.next_resume_touch = now + timedelta(minutes=5)
-                        if touch_cooldown and touch_cooldown > state.next_resume_touch:
-                            state.next_resume_touch = touch_cooldown
-                        if success:
-                            state.resume_touch_status = "✅ Поднято!"
-                            self._add_log(
-                                state.short, state.color,
-                                f"✅ Резюме поднято! Следующая проверка в {state.next_resume_touch.strftime('%H:%M')}",
-                                "success",
-                            )
-                        else:
-                            state.resume_touch_status = f"⏳ {message}"
-                            self._add_log(
-                                state.short, state.color,
-                                f"\U0001f4e4 {message}. Следующая проверка статуса в {state.next_resume_touch.strftime('%H:%M')}",
-                                "warning",
-                            )
-                    else:
-                        # Без подтверждённого разрешения от HH ручку publish не
-                        # вызываем. Сетевая ошибка статуса не должна вести к 429.
-                        state.next_resume_touch = now + timedelta(minutes=5)
-                        state.resume_touch_status = "⏳ Не удалось проверить доступность"
+            self._maybe_touch_resume(state, acc)
 
             # === ПРОВЕРКА ЛИМИТА ===
             if state.limit_exceeded:
@@ -1602,7 +2057,10 @@ class BotManager:
                     if not get_client(acc).check_limit():
                         state.limit_exceeded = False
                         state.limit_reset_time = None
-                        state.paused = False
+                        # Ручную паузу, поставленную во время проверки, не снимаем.
+                        if state.paused_reason in ("", "limit"):
+                            state.paused = False
+                            state.paused_reason = ""
                         state.hard_stopped = False
                         state.status_detail = ""
                         self._add_log(
@@ -1628,12 +2086,12 @@ class BotManager:
 
             # === СБОР ВАКАНСИЙ (ПАРАЛЛЕЛЬНО) ===
             # Если у аккаунта нет своих URL — используем глобальный пул
-            effective_urls = list(acc.get("urls") or [_url_entry(u)["url"] for u in CONFIG.url_pool])
+            effective_urls = _search_urls(acc)
             # Auto-merge сохранённых поисков юзера с hh.ru (cached 1h) — добавляются
             # к существующему пулу. items_url у HH возвращается в api.hh.ru-домене;
             # cookie-collector использует hh.ru/search/vacancy, поэтому конвертируем.
             try:
-                for ss in fetch_saved_vacancy_searches(acc):
+                for ss in (fetch_saved_vacancy_searches(acc) if acc.get("include_saved_searches", True) else []):
                     iu = ss.get("items_url", "") or ""
                     if not iu:
                         continue
@@ -1643,6 +2101,15 @@ class BotManager:
             except Exception as e:
                 log_debug(f"saved_searches merge error [{state.short}]: {e}")
             state.total_urls = len(effective_urls)
+            acc["_cycle_search_urls"] = list(effective_urls)
+            state.active_search_urls = list(effective_urls)
+            if not effective_urls:
+                state.status = "waiting"
+                state.status_detail = "Поиски не выбраны — отклики не отправляются"
+                state.cycle_summary = {"found": 0, "eligible": 0, "already": 0, "tests": 0, "filtered": 0}
+                if self._wait_between_cycles(state, CONFIG.pause_between_cycles):
+                    return
+                continue
 
             state.status = "collecting"
             state.status_detail = "Начинаю параллельный сбор..."
@@ -1662,7 +2129,7 @@ class BotManager:
             use_oauth_collect = _uses_api_search(acc, state)
             try:
                 if use_oauth_collect:
-                    results_by_url, salary_map, schedule_map = self._collect_via_oauth_api(state)
+                    results_by_url, salary_map, schedule_map = self._collect_via_oauth_api(state, acc=acc)
                     # degraded_mode = "web cookies были живые и умерли, теперь
                     # едем на OAuth-fallback". Для чисто mobile-flow (OTP-логин,
                     # никогда не было web cookies) это НЕ degraded — это штатный
@@ -1678,7 +2145,7 @@ class BotManager:
                             "warning",
                         )
                 else:
-                    results_by_url, salary_map, schedule_map = asyncio.run(self._collect_all_urls_parallel(state))
+                    results_by_url, salary_map, schedule_map = asyncio.run(self._collect_all_urls_parallel(state, acc=acc))
                     if not state.cookies_expired:
                         # Снимаем degraded флаг если cookies снова валидны.
                         state.degraded_mode = False
@@ -1759,6 +2226,9 @@ class BotManager:
             except Exception as e:
                 log_debug(f"blacklist filter error [{state.short}]: {e}")
             state._favorited_ids = favorited_ids  # для приоритизации в apply
+            # «Избранное» и «Похожие» приходят только id — без названия фильтр
+            # ниже их молча отбрасывал. Дотягиваем карточку через OAuth.
+            self._enrich_missing_meta(state, acc, unique_vacancies, salary_map, schedule_map)
             total_collected = len(unique_vacancies)
 
             self._add_log(
@@ -1773,6 +2243,7 @@ class BotManager:
                     # тогда уже честная пауза до обновления кук.
                     state.paused = True
                     state.paused_reason = "auth"
+                    self._persist_protective_pause(state)
                     self._add_log(
                         state.short, state.color,
                         "⚠️ Куки протухли и OAuth-fallback пуст. Обновите куки.", "error",
@@ -1786,7 +2257,8 @@ class BotManager:
                     "⚠️ Не найдено ни одной вакансии, пауза 2 мин",
                     "warning",
                 )
-                time.sleep(120)
+                if self._wait_between_cycles(state, 120):
+                    return
                 continue
 
             # Фильтрация
@@ -1800,13 +2272,13 @@ class BotManager:
             state.rating_skipped = 0  # per-cycle counter, reset here
             apply_tests = state.apply_tests or CONFIG.auto_apply_tests
             configured_title_include = resume_filter_value(
-                state.acc, state.acc.get("resume_hash", ""), "title_include_keywords"
+                acc, acc.get("resume_hash", ""), "title_include_keywords"
             )
             configured_title_exclude = resume_filter_value(
-                state.acc, state.acc.get("resume_hash", ""), "title_exclude_keywords"
+                acc, acc.get("resume_hash", ""), "title_exclude_keywords"
             )
-            resume_profile = normalize_resume_filters(state.acc.get("resume_filters")).get(
-                str(state.acc.get("resume_hash", "")), {}
+            resume_profile = normalize_resume_filters(acc.get("resume_filters")).get(
+                str(acc.get("resume_hash", "")), {}
             )
             resume_work_formats = set(resume_profile.get("allowed_work_formats") or [])
             has_resume_work_format_rule = "allowed_work_formats" in resume_profile
@@ -1823,13 +2295,14 @@ class BotManager:
             employer_exclude_keywords = [
                 str(k).strip().lower()
                 for k in resume_filter_value(
-                    state.acc, state.acc.get("resume_hash", ""), "employer_exclude_keywords"
+                    acc, acc.get("resume_hash", ""), "employer_exclude_keywords"
                 )
                 if str(k).strip()
             ]
 
             discard_skipped = 0
             unsafe_skipped = 0
+            old_skipped = 0
             for vid in unique_vacancies:
                 meta = state.vacancy_meta.get(vid, {})
                 title = (meta.get("title") or "").lower()
@@ -1857,25 +2330,14 @@ class BotManager:
                         f"{vid}: redirect → {meta.get('immediate_redirect_vacancy_id')}"
                     )
                     continue
-                # Для senior-профиля 6+ — самостоятельная ветка: вакансия
-                # проходит даже без слова Senior/Lead в заголовке. Запросы по
-                # диапазонам выполняются отдельно, поэтому этот признак не
-                # смешивается с обычным диапазоном 3–6 лет.
-                experience_filters = set(meta.get("experience_filters") or [])
-                title_matches = any(k in title for k in title_include_keywords)
-                qualifies_by_experience = "moreThan6" in experience_filters
-                if title_include_keywords and not title_matches and not qualifies_by_experience:
+                allowed_experience = resume_profile.get("experience") or []
+                # Missing experience is not permission to bypass a strict rule.
+                if not _experience_allowed(acc, meta, vid, allowed_experience):
                     title_skipped += 1
                     continue
-                is_fullstack = any(term in title for term in ("fullstack", "full-stack", "full stack"))
-                is_nest_fullstack = is_fullstack and any(
-                    term in title for term in ("nestjs", "nest.js", "nest js")
-                )
-                if (
-                    title_exclude_keywords
-                    and any(k in title for k in title_exclude_keywords)
-                    and not is_nest_fullstack
-                ):
+                experience_filters = _experience_ids(meta.get("experience")) or list(meta.get("experience_filters") or [])
+                if not _title_allowed(title, title_include_keywords, title_exclude_keywords, experience_filters,
+                                      role_include=acc.get("title_include_keywords") or []):
                     title_skipped += 1
                     continue
                 # HH сам метит вакансии меткой DISCARD когда нас уже отвергли —
@@ -1891,6 +2353,43 @@ class BotManager:
                     meta.get("has_test") or meta.get("response_letter_required")
                 ):
                     state.degraded_skipped += 1
+                    continue
+                if _too_old_for_period(meta):
+                    old_skipped += 1
+                    continue
+                # Дешёвые локальные проверки — ДО сетевых запросов деталей и
+                # рейтинга: раньше они шли для каждой вакансии, включая те, на
+                # которые уже откликались (лишняя нагрузка на HH → капча/429).
+                if is_applied(acc["name"], vid):
+                    already_count += 1
+                    state.seen_already.add(vid)
+                    state.already_applied += 1
+                    continue
+                if is_review_pending(acc["name"], vid):
+                    continue
+                if (is_test(vid, acc["name"], acc.get("resume_hash", "")) or state._test_failures.get(vid, 0) >= 2) and not apply_tests:
+                    test_count += 1
+                    state.seen_tests.add(vid)
+                    state.tests += 1
+                    continue
+                if has_resume_work_format_rule and resume_work_formats:
+                    actual_formats = {
+                        str(value).strip().upper()
+                        for value in (meta.get("work_formats") or meta.get("work_format_filters") or [])
+                        if str(value).strip()
+                    }
+                    if actual_formats and not actual_formats.intersection(resume_work_formats):
+                        schedule_skipped += 1
+                        continue
+                elif not has_resume_work_format_rule and CONFIG.allowed_schedules:
+                    # Пустой список форматов у резюме явно отключает глобальный фильтр.
+                    sched = schedule_map.get(vid, set())
+                    if sched and not sched.intersection(CONFIG.allowed_schedules):
+                        schedule_skipped += 1
+                        continue
+                if _salary_too_low(salary_map, vid):
+                    salary_skipped += 1
+                    state.salary_skipped += 1
                     continue
                 # Vacancy quality gates через GET /vacancies/{vid} — lazy: вызываем
                 # только если хотя бы один из флагов включён (иначе extra-fetch для
@@ -1934,63 +2433,12 @@ class BotManager:
                         # Cache hit для UI / Apply tab
                         if rating_info:
                             meta["employer_rating"] = rating_info
-                if is_applied(acc["name"], vid):
-                    already_count += 1
-                    state.already_applied += 1
-                elif (is_test(vid) or state._test_failures.get(vid, 0) >= 2) and not apply_tests:
-                    test_count += 1
-                    state.tests += 1
-                elif has_resume_work_format_rule and resume_work_formats:
-                    actual_formats = {
-                        str(value).strip().upper()
-                        for value in (meta.get("work_formats") or meta.get("work_format_filters") or [])
-                        if str(value).strip()
-                    }
-                    if actual_formats and not actual_formats.intersection(resume_work_formats):
-                        schedule_skipped += 1
-                    elif CONFIG.min_salary > 0:
-                        sal = salary_map.get(vid)
-                        if sal is None or sal < CONFIG.min_salary:
-                            salary_skipped += 1
-                            state.salary_skipped += 1
-                        else:
-                            filtered.append(vid)
-                    else:
-                        filtered.append(vid)
-                elif has_resume_work_format_rule:
-                    # An explicitly empty per-resume format list disables the
-                    # legacy global schedule fallback for this resume.
-                    if CONFIG.min_salary > 0:
-                        sal = salary_map.get(vid)
-                        if sal is None or sal < CONFIG.min_salary:
-                            salary_skipped += 1
-                            state.salary_skipped += 1
-                        else:
-                            filtered.append(vid)
-                    else:
-                        filtered.append(vid)
-                elif CONFIG.allowed_schedules:
-                    sched = schedule_map.get(vid, set())
-                    if sched and not sched.intersection(CONFIG.allowed_schedules):
-                        schedule_skipped += 1
-                    elif CONFIG.min_salary > 0:
-                        sal = salary_map.get(vid)
-                        if sal is None or sal < CONFIG.min_salary:
-                            salary_skipped += 1
-                            state.salary_skipped += 1
-                        else:
-                            filtered.append(vid)
-                    else:
-                        filtered.append(vid)
-                elif CONFIG.min_salary > 0:
-                    sal = salary_map.get(vid)
-                    if sal is None or sal < CONFIG.min_salary:
-                        salary_skipped += 1
-                        state.salary_skipped += 1
-                    else:
-                        filtered.append(vid)
-                else:
-                    filtered.append(vid)
+                filtered.append(vid)
+
+            state.last_search_at = datetime.now().astimezone().isoformat()
+            state.cycle_summary = {"found": len(unique_vacancies), "eligible": len(filtered),
+                                   "already": already_count, "tests": test_count,
+                                   "filtered": max(0, len(unique_vacancies) - len(filtered) - already_count - test_count)}
 
             # Приоритизация: свежие → favorited → quick-response → остальные.
             # Сначала перемешиваем, чтобы старые вакансии одного класса не имели
@@ -2023,6 +2471,7 @@ class BotManager:
             discard_msg = f", \U0001f6ab отказали {discard_skipped}" if discard_skipped else ""
             unsafe_msg = f", \u26a0\ufe0f сомнительные/redirect {unsafe_skipped}" if unsafe_skipped else ""
             rating_msg = f", ⭐ рейтинг {state.rating_skipped}" if state.rating_skipped else ""
+            rating_msg += f", 📅 старше {CONFIG.search_period_days} дн {old_skipped}" if old_skipped else ""
             self._add_log(
                 state.short, state.color,
                 f"\U0001f50d Фильтрация: ✅ уже {already_count}, \U0001f9ea тест {test_count}{sal_msg}{sched_msg}{title_msg}{employer_msg}{discard_msg}{unsafe_msg}{rating_msg}, \U0001f195 новые {len(filtered)}",
@@ -2037,42 +2486,25 @@ class BotManager:
                     f"⚠️ Все вакансии уже обработаны ({already_count} откликов, {test_count} тестов), пауза 2 мин",
                     "warning",
                 )
-                time.sleep(120)
+                if self._wait_between_cycles(state, 120):
+                    return
                 continue
 
             # Hot leads priority: fetch possible_job_offers and put matching vacancies first
             try:
-                r_offers = HH.get(
-                    hh_base() + "/shards/applicant/negotiations/possible_job_offers",
-                    headers={
-                        "User-Agent": webview_user_agent(),
-                        "Accept": "application/json",
-                        "X-Xsrftoken": acc.get("cookies", {}).get("_xsrf", ""),
-                        "Referer": hh_base() + "/applicant/negotiations",
-                    },
-                    cookies=acc.get("cookies", {}), cookie_jar_key=_token_key(acc) or None,
-                    timeout=10,
-                )
-                if r_offers.status_code == 200:
-                    offers_data = r_offers.json()
-                    offer_items = offers_data if isinstance(offers_data, list) else offers_data.get("possibleJobOffers", [])
-                    offer_vids = set()
-                    for o in offer_items:
-                        vid_val = o.get("vacancyId", "")
-                        if vid_val:
-                            offer_vids.add(str(vid_val))
-                    if offer_vids:
-                        # Hot leads выше внутри своей freshness-категории, но
-                        # старый hot lead не вытесняет только что опубликованную вакансию.
-                        filtered.sort(key=lambda v: (
-                            0 if (CONFIG.fresh_vacancies_mode and _is_fresh_vacancy(
-                                state.vacancy_meta.get(v, {}) or {}, CONFIG.fresh_vacancy_hours)) else 1,
-                            0 if v in offer_vids else 1,
-                        ))
-                        hot = [v for v in filtered if v in offer_vids]
-                        if hot:
-                            self._add_log(state.short, state.color,
-                                f"\U0001f525 {len(hot)} горячих лидов в начале очереди", "success")
+                offer_vids = self._hot_lead_vids(acc)
+                if offer_vids:
+                    # Hot leads выше внутри своей freshness-категории, но
+                    # старый hot lead не вытесняет только что опубликованную вакансию.
+                    filtered.sort(key=lambda v: (
+                        0 if (CONFIG.fresh_vacancies_mode and _is_fresh_vacancy(
+                            state.vacancy_meta.get(v, {}) or {}, CONFIG.fresh_vacancy_hours)) else 1,
+                        0 if v in offer_vids else 1,
+                    ))
+                    hot = [v for v in filtered if v in offer_vids]
+                    if hot:
+                        self._add_log(state.short, state.color,
+                            f"\U0001f525 {len(hot)} горячих лидов в начале очереди", "success")
             except Exception:
                 pass
 
@@ -2100,7 +2532,8 @@ class BotManager:
 
             while i < len(filtered):
                 if (self._stop_event.is_set() or self.paused or state.paused
-                        or state.limit_exceeded or getattr(state, "_deleted", False)):
+                        or state.limit_exceeded or getattr(state, "_deleted", False)
+                        or _apply_context_key(state.acc) != cycle_context):
                     break
 
                 self._maybe_roll_daily_counter(state)
@@ -2188,7 +2621,9 @@ class BotManager:
                 if state.safety_enabled:
                     checked_batch = []
                     for vid in batch:
-                        if self.paused or self._stop_event.is_set() or state.paused or getattr(state, "_deleted", False):
+                        if (self.paused or self._stop_event.is_set() or state.paused
+                                or getattr(state, "_deleted", False)
+                                or _apply_context_key(state.acc) != cycle_context):
                             break
                         precheck = get_client(acc).check_vacancy_before_apply(vid)
                         if not precheck["ok"]:
@@ -2248,27 +2683,18 @@ class BotManager:
                     break
                 if state.use_oauth or CONFIG.use_oauth_apply or state.degraded_mode:
                     # OAuth: synchronous, one by one (API doesn't support batch)
-                    results = []
-                    for vid in batch:
-                        if self.paused or self._stop_event.is_set() or state.paused or getattr(state, "_deleted", False):
-                            break
-                        try:
-                            result = _oauth_apply(acc, vid, acc.get("letter", ""))
-                            results.append(result)
-                            if result[0] == "captcha":
-                                break
-                        except Exception as e:
-                            results.append(e)
-                        if CONFIG.response_delay > 0:
-                            time.sleep(CONFIG.response_delay)
+                    results = self._send_oauth_batch(state, acc, batch, cycle_context)
                 else:
                     # Web: async batch via aiohttp
                     client = get_client(acc)
                     def _make_send_batch(b):
+                        async def guarded_send(vid):
+                            if not self._dispatch_allowed(state, cycle_context):
+                                return "cancelled", {}
+                            return await client.submit_response(
+                                vid, letter_max_length=state.vacancy_meta.get(vid, {}).get("letter_max_length"))
                         async def send_batch():
-                            tasks = [client.submit_response(vid,
-                                        letter_max_length=state.vacancy_meta.get(vid, {}).get("letter_max_length"))
-                                     for vid in b]
+                            tasks = [guarded_send(vid) for vid in b]
                             return await asyncio.gather(*tasks, return_exceptions=True)
                         return send_batch
                     results = asyncio.run(_make_send_batch(batch)())
@@ -2284,7 +2710,8 @@ class BotManager:
                     # 30с назад» даже когда удачных откликов давно не было.
                     state.last_apply_attempt_at = datetime.now().isoformat(timespec="seconds")
                     if isinstance(result_data, Exception):
-                        state.errors += 1
+                        self._record_apply_error(state, vid, "transport_error")
+                        self._hold_unconfirmed_submission(state, acc, vid)
                         state.consecutive_errors += 1
                         err_msg = str(result_data)[:60]
                         self._add_log(state.short, state.color, f"❌ {vid}: {err_msg}", "error")
@@ -2293,6 +2720,9 @@ class BotManager:
                         continue
 
                     result, info = result_data
+
+                    if result == "cancelled":
+                        continue
 
                     if result == "sent":
                         state.sent += 1
@@ -2345,8 +2775,7 @@ class BotManager:
                                             salary if salary else "")
 
                     elif result == "test":
-                        if (self.paused or self._stop_event.is_set() or state.paused
-                                or state.hard_stopped or state._deleted):
+                        if not self._dispatch_allowed(state, cycle_context):
                             continue
                         title = info.get("title", "")
                         company = info.get("company", "")
@@ -2367,6 +2796,8 @@ class BotManager:
                             # Пробуем автозаполнить опрос
                             q_result, q_info = asyncio.run(get_client(acc).fill_questionnaire(
                                 vid, vacancy_title=title, company=company))
+                            if q_result == "cancelled":
+                                continue
                             if q_result == "sent":
                                 state.sent += 1
                                 state.questionnaire_sent += 1
@@ -2396,30 +2827,35 @@ class BotManager:
                                 self._add_log(state.short, state.color,
                                               f"\U0001f6ab ЛИМИТ при опросе! Повторная попытка в {state.limit_reset_time.strftime('%H:%M')}",
                                               "error")
-                                break
+                                continue
                             elif q_result == "auth_error":
                                 log_debug(f"AUTH_ERROR [{state.short}] vid={vid} flow=questionnaire")
                                 state.cookies_expired = True
                                 state.paused = True
+                                state.paused_reason = "auth"
+                                self._persist_protective_pause(state)
                                 self._add_log(
                                     state.short, state.color,
                                     "⚠️ Куки протухли! Обновите куки и снимите паузу.", "error",
                                 )
                                 self._add_acc_event(state, "⚠️", "error", "Авторизация", "", "Обновите куки")
-                                break
+                                continue
                             elif q_result == 'error':
                                 # A transport/confirmation error does not mean
                                 # the applicant failed the employer's test.
                                 reason = q_info.get('error_code') or q_info.get('exception') or 'HTTP error'
-                                state.errors += 1
+                                self._record_apply_error(state, vid, "questionnaire_unconfirmed", q_info)
                                 state.paused = True
-                                state.paused_reason = 'manual'
+                                # Отдельная причина: это не ручная пауза пользователя,
+                                # а анкета, судьбу которой надо проверить в HH.
+                                state.paused_reason = 'review'
+                                self._persist_protective_pause(state)
                                 self._add_response(state, vid, title, company, 'error')
                                 self._add_log(state.short, state.color,
                                               f'Анкета: результат не подтверждён ({reason}). Пауза: проверьте отклик в HH перед продолжением.', 'warning')
                                 # Hold ambiguous submissions for manual review;
                                 # never blindly resend a potentially accepted form.
-                                add_test_vacancy(vid, title, company, acc['name'], acc.get('resume_hash', ''))
+                                add_test_vacancy(vid, title, company, acc['name'], acc.get('resume_hash', ''), status='review')
                             else:
                                 # Не удалось — считаем неудачи
                                 state._test_failures[vid] = state._test_failures.get(vid, 0) + 1
@@ -2442,6 +2878,21 @@ class BotManager:
                         self._push_action(state, f"\U0001f504 {vid}")
                         self._add_response(state, vid, "", "", "already")
 
+                    elif result == "limit" and (info or {}).get("rate_limited"):
+                        # 429: HH просит реже, дневной лимит тут ни при чём.
+                        wait_s = max(int((info or {}).get("retry_after") or 0), 120)
+                        log_debug(f"HH_RATE_LIMIT [{state.short}] vid={vid} wait={wait_s}s")
+                        state.limit_exceeded = True
+                        state.limit_reset_time = datetime.now() + timedelta(seconds=wait_s)
+                        state.status = "limit"
+                        state.status_detail = f"HH просит реже: пауза до {state.limit_reset_time.strftime('%H:%M')}"
+                        self._add_log(
+                            state.short, state.color,
+                            f"🐢 HH ограничил частоту запросов (429). Продолжу в {state.limit_reset_time.strftime('%H:%M')}",
+                            "warning",
+                        )
+                        continue
+
                     elif result == "limit":
                         log_debug(f"HH_LIMIT [{state.short}] vid={vid} retry_after={info.get('retry_after_seconds', '?')}")
                         state.limit_exceeded = True
@@ -2452,7 +2903,8 @@ class BotManager:
                             # paused_reason="limit" — чтобы _maybe_roll_daily_counter
                             # автоматически снял паузу в полночь МСК. Без этого
                             # бот сидел на паузе несколько дней подряд (bug fix).
-                            state.paused_reason = "limit"
+                            if state.paused_reason not in ("review", "captcha", "auth", "manual"):
+                                state.paused_reason = "limit"
                             state.status = "limit"
                             state.status_detail = "\U0001f6d1 Лимит HH — остановлен до 00:00 МСК"
                             self._add_log(
@@ -2471,17 +2923,19 @@ class BotManager:
                                 f"\U0001f6ab ЛИМИТ! Повторная попытка в {state.limit_reset_time.strftime('%H:%M')}",
                                 "error",
                             )
-                        break
+                        continue
 
                     elif result == "captcha":
                         with state._state_lock:
                             state.paused = True
-                            state.paused_reason = "captcha"
+                            if state.paused_reason != "review":
+                                state.paused_reason = "captcha"
                             state.captcha_url = info.get("captcha_url", "")
+                        self._persist_protective_pause(state)
                         self._add_log(state.short, state.color,
                                       "HH требует CAPTCHA при отклике. Откройте проверку в карточке профиля.", "warning")
                         self._add_acc_event(state, "⚠️", "error", "Проверка HH", "", "captcha_required")
-                        break
+                        continue
 
                     elif result == "auth_error":
                         oauth_capable = (
@@ -2503,20 +2957,25 @@ class BotManager:
                             state.cookies_expired = True
                             # Прервать текущий батч cookie-applies, не пытаемся снова
                             # тем же путём в этом цикле.
-                            break
+                            continue
                         else:
                             log_debug(f"AUTH_ERROR [{state.short}] vid={vid} flow=apply")
                             state.cookies_expired = True
                             state.paused = True
+                            if state.paused_reason != "review":
+                                state.paused_reason = "auth"
+                            self._persist_protective_pause(state)
                             self._add_log(
                                 state.short, state.color,
                                 "⚠️ Куки протухли! Обновите куки и снимите паузу.", "error",
                             )
                             self._add_acc_event(state, "⚠️", "error", "Авторизация", "", "Обновите куки")
-                            break
+                            continue
 
                     elif result == "error":
-                        state.errors += 1
+                        self._record_apply_error(state, vid, "submission_unconfirmed", info)
+                        if info.get("review_required"):
+                            self._hold_unconfirmed_submission(state, acc, vid)
                         self._push_action(state, f"❌ {vid}")
                         self._add_response(state, vid, "", "", "error")
                         raw = info.get("raw", "")[:80] if info else ""
@@ -2528,6 +2987,11 @@ class BotManager:
                         # батче не бракуются `if state.paused: break` циклом ниже.
                         transient = 'error_code' in (info or {}) and (info or {}).get('error_code') == 'unknown'
                         transient = transient or 'unknown' in raw.lower()[:40]
+                        # Временные сбои HH (5xx), удалённая вакансия (404) и отказ
+                        # по правилам конкретной вакансии (403) — не проблема
+                        # профиля: не копим их в «ошибки подряд» → авто-паузу.
+                        transient = transient or bool((info or {}).get("transient"))
+                        transient = transient or (info or {}).get("http_status") in (403, 404)
                         if not transient:
                             state.consecutive_errors += 1
                         self._add_log(state.short, state.color, f"❌ {vid}: {debug_info}", "error")
@@ -2559,6 +3023,9 @@ class BotManager:
                 # Show the pause reason immediately instead of hiding it behind
                 # the normal (potentially long) inter-cycle sleep.
                 continue
+            if _apply_context_key(state.acc) != cycle_context:
+                # A settings edit is not a completed cycle: rebuild immediately.
+                continue
             if not state.limit_exceeded:
                 state.status = "waiting"
                 state.status_detail = "Цикл завершён"
@@ -2567,7 +3034,7 @@ class BotManager:
                     f"⏳ Цикл завершён, пауза {CONFIG.pause_between_cycles}с",
                     "info",
                 )
-                if self._stop_event.wait(CONFIG.pause_between_cycles):
+                if self._wait_between_cycles(state, CONFIG.pause_between_cycles):
                     return
 
     def _hh_limit_tracker_worker(self):
@@ -2654,7 +3121,7 @@ class BotManager:
             if self._stop_event.wait(6 * 3600):
                 return
 
-    def _collect_via_oauth_api(self, state: AccountState) -> tuple:
+    def _collect_via_oauth_api(self, state: AccountState, acc: dict | None = None) -> tuple:
         """Degraded-mode collection via api.hh.ru/vacancies with Bearer token.
         Used when cookies are dead but OAuth refresh_token still valid.
 
@@ -2666,8 +3133,8 @@ class BotManager:
         collector. Also writes has_test / response_letter_required into vacancy_meta so
         the apply loop can skip vacancies we can't fulfil without cookies.
         """
-        acc = state.acc
-        effective_urls = acc.get("urls") or [_url_entry(u)["url"] for u in CONFIG.url_pool]
+        acc = state.acc if acc is None else acc
+        effective_urls = _search_urls(acc)
         results_by_url = {url: [] for url in effective_urls}
         salary_map: dict = {}
         schedule_map: dict = {}
@@ -2696,8 +3163,7 @@ class BotManager:
             else [None]
         )
         total_pages = (
-            len(effective_urls) * configured_pages
-            * len(experience_values) * len(work_format_values)
+            len(effective_urls) * len(experience_values) * len(work_format_values)
         )
         log_debug(
             f"MOBILE_COLLECT_CONFIG [{state.short}] configured_pages={configured_pages} "
@@ -2731,8 +3197,8 @@ class BotManager:
                             max_pages=pages)
                         # Defensive cap для сторонних реализаций контракта.
                         items = items[:pages * 50]
-                        completed += pages
-                        state.status_detail = f"OAuth-сбор {min(completed, total_pages)}/{total_pages}"
+                        completed += 1
+                        state.status_detail = f"Поисковые запросы: {min(completed, total_pages)} из {total_pages}"
                         for it in items:
                             vid = str(it.get("id") or "")
                             if not vid:
@@ -2741,6 +3207,8 @@ class BotManager:
                             # Build meta entry — mirror parse_vacancy_meta shape
                             meta_entry = state.vacancy_meta.setdefault(vid, {})
                             meta_entry["title"] = it.get("name", "") or meta_entry.get("title", "")
+                            if it.get("experience"):
+                                meta_entry["experience"] = it["experience"]
                             emp = it.get("employer") or {}
                             meta_entry["company"] = emp.get("name", "") or meta_entry.get("company", "")
                             meta_entry["employer_id"] = str(it.get("employer_id") or emp.get("id") or "") or meta_entry.get("employer_id", "")
@@ -2771,9 +3239,7 @@ class BotManager:
                                     if actual_format not in buckets:
                                         buckets.append(actual_format)
                                 meta_entry["work_formats"] = buckets
-                            sal = it.get("salary")
-                            if isinstance(sal, dict):
-                                salary_map[vid] = sal.get("from") or sal.get("to")
+                            salary_map[vid] = _salary_rub(it.get("salary"))
                             sch = it.get("schedule")
                             if isinstance(sch, dict) and sch.get("id"):
                                 schedule_map.setdefault(vid, set()).add(sch["id"])
@@ -2782,12 +3248,12 @@ class BotManager:
             results_by_url[url] = ids_for_url
         return results_by_url, salary_map, schedule_map
 
-    async def _collect_all_urls_parallel(self, state: AccountState) -> tuple:
+    async def _collect_all_urls_parallel(self, state: AccountState, acc: dict | None = None) -> tuple:
         """
         Параллельный сбор вакансий со ВСЕХ URL и страниц одновременно.
         Возвращает (results_by_url: dict[url, set[ids]], salary_map: dict[vid, int|None], schedule_map: dict[vid, set])
         """
-        acc = state.acc
+        acc = state.acc if acc is None else acc
         xsrf = acc.get("cookies", {}).get("_xsrf", "")
         if not xsrf:
             return {}, {}, {}
@@ -2815,7 +3281,7 @@ class BotManager:
         all_tasks = []
         url_pages = _url_pages_map()
         acc_url_pages = acc.get("url_pages", {})  # per-account override
-        effective_urls = acc.get("urls") or [_url_entry(u)["url"] for u in CONFIG.url_pool]
+        effective_urls = _search_urls(acc)
         # Build extra search filter params from config
         # Note: HH only accepts ONE label param; low_competition takes priority
         extra_params = ""
@@ -2952,9 +3418,36 @@ class BotManager:
 
         return {url: set(ids) for url, ids in results_by_url.items()}, salary_map, schedule_map
 
+    def _llm_processing_allowed(self, state: AccountState) -> bool:
+        return bool(state.llm_enabled and CONFIG.llm_enabled
+                    and not getattr(self, "paused", False) and not state.paused
+                    and not getattr(state, "_deleted", False)
+                    and not (getattr(self, "_stop_event", None) and self._stop_event.is_set()))
+
+    def _llm_history(self, state: AccountState, neg_id: str) -> list:
+        if state.cookies_expired or CONFIG.chat_use_oauth:
+            history = fetch_negotiation_messages_oauth(state.acc, neg_id, max_messages=20)
+            if history:
+                return history
+        return get_client(state.acc).fetch_chat_history(neg_id, max_messages=20)
+
+    def _llm_conversation_unchanged(self, state: AccountState, neg_id: str, original: list) -> bool:
+        """Fail closed if the conversation changed or cannot be reloaded."""
+        def signature(messages):
+            return [(m.get("sender"), m.get("text"), str(m.get("msg_id") or m.get("id") or ""),
+                     m.get("actions") or {}) for m in messages]
+        try:
+            current = self._llm_history(state, neg_id)
+            return bool(current) and signature(current) == signature(original)
+        except Exception:
+            return False
+
+    def _llm_send_allowed(self, state: AccountState) -> bool:
+        return self._llm_processing_allowed(state) and bool(CONFIG.llm_auto_send)
+
     def _process_llm_replies(self, state: AccountState) -> None:
         """Check recent unread negotiations for employer messages and auto-reply using LLM."""
-        if not state.llm_enabled:
+        if not self._llm_processing_allowed(state):
             return
         # Non-blocking: if another thread is already processing this account, skip
         if not state._llm_lock.acquire(blocking=False):
@@ -3138,11 +3631,14 @@ class BotManager:
         self._add_log(state.short, state.color, f"\U0001f916 LLM: {len(candidates)} чатов требуют ответа", "info")
 
         for i, neg_id in enumerate(cycle):
-            if not state.llm_enabled or not CONFIG.llm_enabled:
+            if not self._llm_processing_allowed(state):
                 self._add_log(state.short, state.color, f"\U0001f916 LLM: выключен в процессе цикла, прерываю", "warning")
                 break
             # Reset per-iteration: иначе exception на новой итерации видит global_key из ПРЕДЫДУЩЕЙ.
             global_key = None
+            # True только пока ЭТОТ поток держит резервацию global_key: снимать
+            # чужую резервацию (другой профиль того же HH-пользователя) нельзя.
+            reserved = False
             try:
                 if neg_id in state._llm_no_chat:
                     item = items_by_id.get(neg_id, {})
@@ -3226,6 +3722,10 @@ class BotManager:
                     continue
                 last_msg_id = thread["last_msg_id"]
                 key = (neg_id, last_msg_id)
+                if is_message_review_pending(neg_id, last_msg_id):
+                    self._add_log(state.short, state.color,
+                        "Результат прошлой отправки неизвестен — проверьте чат HH вручную", "warning", neg_id=neg_id)
+                    continue
                 # Legacy: pre-r1 records без replied_msg_id мечены sentinel '__legacy__'.
                 # Если такой sentinel есть — значит мы уже отвечали в этот чат до апгрейда.
                 # Пропускаем, не дожидаясь нового HH-сообщения (r13-1 #6).
@@ -3276,13 +3776,7 @@ class BotManager:
                     resume_text = ""
                 # OAuth-путь когда cookies dead или включён CONFIG.chat_use_oauth —
                 # GET /negotiations/{id}/messages не зависит от chatik-кук.
-                if state.cookies_expired or CONFIG.chat_use_oauth:
-                    full_history = fetch_negotiation_messages_oauth(state.acc, neg_id, max_messages=20)
-                    if not full_history:
-                        # Fallback на chatik если OAuth ничего не вернул (404 / 403 / token issue)
-                        full_history = get_client(state.acc).fetch_chat_history(neg_id, max_messages=20)
-                else:
-                    full_history = get_client(state.acc).fetch_chat_history(neg_id, max_messages=20)
+                full_history = self._llm_history(state, neg_id)
                 conversation = full_history if full_history else thread["messages"]
 
                 _last_emp_raw = None
@@ -3312,6 +3806,17 @@ class BotManager:
                     upsert_interview(neg_id, acc=state.short, acc_color=state.color,
                                      employer=employer_short, vacancy_title=vacancy_title, vacancy_id=vacancy_id,
                                      chat_status="robot")
+                    if not self._llm_send_allowed(state):
+                        upsert_interview(neg_id, acc=state.short, llm_reply=btn_text, llm_sent=False)
+                        self._push_llm_log({
+                            "time": datetime.now().strftime("%d.%m %H:%M"),
+                            "acc": state.short, "color": state.color,
+                            "employer": employer_short, "vacancy_title": vacancy_title,
+                            "neg_id": neg_id, "vacancy_id": vacancy_id,
+                            "employer_msg": employer_msg, "bot_reply": btn_text,
+                            "sent": False, "source": "robot_draft",
+                        })
+                        continue
                     # Аудит 2026-08-17 #10: раньше robot-flow отправлял сразу без
                     # резервации global_key → под конкурентными циклами двух
                     # аккаунтов один и тот же workflow_button слался дважды.
@@ -3322,6 +3827,7 @@ class BotManager:
                             state.llm_replied_msgs[key] = None
                             continue
                         self._llm_sent_global.add(global_key)
+                        reserved = True
                     try:
                         _selected_btn = (
                             _text_buttons[_btn_idx]
@@ -3350,6 +3856,13 @@ class BotManager:
                                 or _event.get("type")
                             )
                         _client = get_client(state.acc)
+                        if not self._llm_conversation_unchanged(state, neg_id, conversation) or not self._llm_send_allowed(state):
+                            with self._llm_sent_lock:
+                                self._llm_sent_global.discard(global_key)
+                            reserved = False
+                            self._add_log(state.short, state.color,
+                                "Переписка изменилась или недоступна — автоответ отложен", "warning", neg_id=neg_id)
+                            continue
                         if _event:
                             ok = _client.send_workflow_event(
                                 neg_id, str(_event),
@@ -3358,12 +3871,13 @@ class BotManager:
                         else:
                             ok = _client.send_message(neg_id, btn_text)
                     except Exception:
-                        with self._llm_sent_lock:
-                            self._llm_sent_global.discard(global_key)
+                        # The outer handler retains the reservation on uncertain sends.
                         raise
                     if ok and ok != "chat_not_found":
                         state.llm_replied_msgs[key] = None
                         replied += 1
+                        state._llm_neg_failures.pop(neg_id, None)
+                        state._llm_temp_skip.pop((neg_id, "exception"), None)
                         # Аудит #22: persist llm_sent+replied_msg_id, чтобы после
                         # рестарта дедуп удержал factor robot-ответы, а не только
                         # in-memory. Без этого перезапуск снова жмёт ту же кнопку.
@@ -3395,6 +3909,7 @@ class BotManager:
                         # следующий цикл смог попробовать снова.
                         with self._llm_sent_lock:
                             self._llm_sent_global.discard(global_key)
+                        reserved = False
                         state._llm_temp_skip[key] = time.time() + 1800
                     continue
 
@@ -3516,6 +4031,7 @@ class BotManager:
                             continue
                         self._llm_sent_global.add(global_key)
                         self._llm_sent_by_neg_id.setdefault(neg_id, set()).add(global_key)
+                        reserved = True
                     self._add_log(state.short, state.color,
                         f"\U0001f916 [{employer_short}] отправляю: «{reply_text[:60]}»", "info", neg_id=neg_id)
                     # Читаем HR-сообщение (галочка «прочитано» в UI HH) + typing indicator
@@ -3527,6 +4043,25 @@ class BotManager:
                         pass
                     _delay = min(4.0, max(2.0, len(reply_text) * 0.03))
                     time.sleep(_delay)
+                    if not self._llm_conversation_unchanged(state, neg_id, conversation):
+                        with self._llm_sent_lock:
+                            self._llm_sent_global.discard(global_key)
+                            self._llm_sent_by_neg_id.get(neg_id, set()).discard(global_key)
+                        reserved = False
+                        with state._llm_drafts_lock:
+                            state._llm_drafts.pop(key, None)
+                        self._add_log(state.short, state.color,
+                            "Переписка изменилась или недоступна — автоответ отложен", "warning", neg_id=neg_id)
+                        continue
+                    if not self._llm_send_allowed(state):
+                        with self._llm_sent_lock:
+                            self._llm_sent_global.discard(global_key)
+                            self._llm_sent_by_neg_id.get(neg_id, set()).discard(global_key)
+                        reserved = False
+                        with state._llm_drafts_lock:
+                            state._llm_drafts[key] = reply_text
+                        upsert_interview(neg_id, acc=state.short, llm_reply=reply_text, llm_sent=False)
+                        continue
                     log_debug(f"LLM [{state.short}] {neg_id}: отправляю сообщение в chatik")
                     ok = get_client(state.acc).send_message(neg_id, reply_text, topic_id=thread.get("topic_id", ""))
                     try:
@@ -3537,6 +4072,7 @@ class BotManager:
                         with self._llm_sent_lock:
                             self._llm_sent_global.discard(global_key)
                             self._llm_sent_by_neg_id.get(neg_id, set()).discard(global_key)
+                        reserved = False
                         state.llm_replied_msgs[key] = None
                         state._llm_no_chat.add(neg_id)
                         upsert_interview(neg_id, acc=state.short, acc_color=state.color,
@@ -3551,6 +4087,7 @@ class BotManager:
                             state._llm_drafts.pop(key, None)  # отправили — кэш не нужен
                         state._msg_consecutive[neg_id] = state._msg_consecutive.get(neg_id, 0) + 1
                         state._llm_neg_failures.pop(neg_id, None)  # clear backoff on success
+                        state._llm_temp_skip.pop((neg_id, "exception"), None)
                         replied += 1
                         upsert_interview(neg_id, acc=state.short, acc_color=state.color,
                                          llm_reply=reply_text, llm_sent=True,
@@ -3577,6 +4114,7 @@ class BotManager:
                         with self._llm_sent_lock:
                             self._llm_sent_global.discard(global_key)
                             self._llm_sent_by_neg_id.get(neg_id, set()).discard(global_key)
+                        reserved = False
                         state._llm_temp_skip[key] = time.time() + 1800
                         upsert_interview(neg_id, acc=state.short, acc_color=state.color,
                                          llm_reply=reply_text, llm_sent=False)
@@ -3631,16 +4169,27 @@ class BotManager:
                 time.sleep(3)  # rate limit between messages
             except Exception as e:
                 log_exception(f"_process_llm_replies {neg_id}", e)
-            finally:
-                # Аудит 2026-08-17 #34: pending_chats раньше держал начальное
-                # число кандидатов до конца цикла — UI показывал «12 висят» уже
-                # после того, как 10 обработано. Декрементим по факту, чтобы
-                # прогресс был виден в реальном времени.
-                state.llm_pending_chats = max(0, state.llm_pending_chats - 1)
-                try:
-                    # Чистим только текущий global_key. На иммедиатных exception'ах
-                    # (до reserve блока) он = None — ничего не трогаем.
-                    if global_key is not None:
+                uncertain = isinstance(e, MessageSendUncertain) or (
+                    isinstance(e, MobileAPIError) and (e.status_code == 0 or e.status_code >= 500)
+                )
+                if reserved and uncertain:
+                    # Do not release the cross-profile reservation or retry this message
+                    # after restart. Delivery is unknown, not a successful send.
+                    state.llm_replied_msgs[key] = None
+                    try:
+                        hold_message_for_review(neg_id, last_msg_id, state.short)
+                    except Exception as persist_error:
+                        log_exception("persist uncertain chat send", persist_error)
+                    self._add_log(state.short, state.color,
+                        "Результат отправки неизвестен. Проверьте чат HH вручную; автоматического повтора не будет.",
+                        "warning", neg_id=neg_id)
+                    continue
+                # Резервацию снимаем только если её держит этот поток. После
+                # УСПЕШНОЙ отправки ключ остаётся в _llm_sent_global: иначе второй
+                # профиль того же HH-пользователя, чья генерация шла параллельно,
+                # отправил бы HR повторный ответ.
+                if reserved and global_key is not None:
+                    try:
                         with self._llm_sent_lock:
                             self._llm_sent_global.discard(global_key)
                             bucket = self._llm_sent_by_neg_id.get(neg_id)
@@ -3648,15 +4197,22 @@ class BotManager:
                                 bucket.discard(global_key)
                                 if not bucket:
                                     self._llm_sent_by_neg_id.pop(neg_id, None)
-                except Exception:
-                    pass
-                # Backoff at chat-level: предотвращает бесконечный retry перманентной ошибки.
-                # 1 ошибка → 5 мин, 2 → 15 мин, 3-5 → 1 час, после 5 → 24 часа (но не permanent —
-                # _llm_no_chat зарезервирован под реальный 409, чтобы не путать).
+                    except Exception:
+                        pass
+                # Backoff только на реальное исключение: 1 → 5 мин, 2 → 15 мин,
+                # 3-5 → 1 час, дальше 24 часа. Раньше блок стоял в finally и рос
+                # на КАЖДОМ проходе (успешный ответ, «уже отвечали», черновик,
+                # сам temp_skip) — живой диалог с HR уходил в блок на сутки.
                 fail_count = state._llm_neg_failures.get(neg_id, 0) + 1
                 state._llm_neg_failures[neg_id] = fail_count
                 backoff = {1: 300, 2: 900, 3: 3600, 4: 3600, 5: 3600}.get(fail_count, 86400)
                 state._llm_temp_skip[(neg_id, "exception")] = time.time() + backoff
+            finally:
+                # Аудит 2026-08-17 #34: pending_chats раньше держал начальное
+                # число кандидатов до конца цикла — UI показывал «12 висят» уже
+                # после того, как 10 обработано. Декрементим по факту, чтобы
+                # прогресс был виден в реальном времени.
+                state.llm_pending_chats = max(0, state.llm_pending_chats - 1)
 
         state.llm_replied_count += replied
         if replied:
@@ -3673,6 +4229,32 @@ class BotManager:
         state.llm_next_check_at = (
             datetime.now() + timedelta(seconds=max(CONFIG.llm_check_interval * 60, 120))
         ).isoformat(timespec="seconds")
+
+    def _stats_blocked(self, state: AccountState) -> bool:
+        """Стоит ли воркер статистики/ИИ: общая пауза, ручная пауза профиля,
+        проблемы авторизации или анкета на ручной проверке."""
+        if self.paused:
+            return True
+        return bool(state.paused and state.paused_reason in ("", "manual", "auth"))
+
+    @staticmethod
+    def _apply_negotiation_stats(state: AccountState, stats: dict) -> None:
+        state.hh_interviews = stats["interview"]
+        state.hh_interviews_recent = stats["recent_interview"]
+        state.hh_viewed = stats["viewed"]
+        state.hh_not_viewed = stats["not_viewed"]
+        state.hh_discards = stats["discard"]
+        state.hh_interviews_list = stats["interviews_list"]
+        state.hh_interview_neg_ids = stats.get("neg_ids", [])
+        state.hh_discard_neg_ids = set(str(x) for x in stats.get("discard_neg_ids", []))
+        state.hh_unread_by_employer = stats.get("unread_by_employer", 0)
+
+        for neg_id in state.hh_interview_neg_ids:
+            upsert_interview(neg_id, acc=state.short, acc_color=state.color)
+        if len(state.hh_interview_neg_ids) == len(stats["interviews_list"]):
+            for neg_id, item in zip(state.hh_interview_neg_ids, stats["interviews_list"]):
+                upsert_interview(neg_id, acc=state.short, acc_color=state.color,
+                                 vacancy_title=item.get("text", ""))
 
     def _fetch_hh_stats_worker(self, idx: int, state: AccountState) -> None:
         """Thread worker for HH stats polling — auto-restarts on crash.
@@ -3697,9 +4279,11 @@ class BotManager:
 
     def _fetch_hh_stats_worker_inner(self, idx: int, state: AccountState) -> None:
         while not self._stop_event.is_set():
-            # state.paused тоже учитываем — иначе paused account продолжает hammer HH APIs (swarm-12 #7).
+            # Ручная/авторизационная пауза останавливает и статистику, чтобы не
+            # дёргать HH зря (swarm-12 #7). Лимит, капча и авто-пауза по ошибкам
+            # касаются только НОВЫХ откликов: ответы HR и статистика продолжаются.
             while (
-                (self.paused or state.paused or getattr(state, "hard_stopped", False))
+                self._stats_blocked(state)
                 and not self._stop_event.is_set()
                 and not getattr(state, "_deleted", False)
             ):
@@ -3718,7 +4302,14 @@ class BotManager:
                 log_debug(f"resume_status fetch error [{state.short}]: {e}")
             try:
                 stats = get_client(state.acc).fetch_negotiations()
-                if stats.get("auth_error"):
+                _is_mobile = str(state.acc.get("mode", "")).strip().lower() in ("mobile", "oauth")
+                if stats.get("auth_error") and _is_mobile:
+                    # Mobile-профиль: сюда попадаем, когда mobile-запрос не прошёл
+                    # и сработал запасной web-путь. Веб-cookies mobile-профилю не
+                    # нужны — не ставим «сессия устарела» и не пропускаем ИИ/статистику.
+                    log_debug(f"stats [{state.short}]: mobile negotiations недоступны, web-fallback без cookies — пропускаю только переговоры")
+                    stats = None
+                if stats and stats.get("auth_error"):
                     log_debug(f"AUTH_ERROR [{state.short}] vid=- flow=stats")
                     state.cookies_expired = True
                     self._add_log(
@@ -3729,23 +4320,8 @@ class BotManager:
                     self._stop_event.wait(max(CONFIG.llm_check_interval * 60, 120))
                     continue
                 old_interviews = state.hh_interviews
-                state.hh_interviews = stats["interview"]
-                state.hh_interviews_recent = stats["recent_interview"]
-                state.hh_viewed = stats["viewed"]
-                state.hh_not_viewed = stats["not_viewed"]
-                state.hh_discards = stats["discard"]
-                state.hh_interviews_list = stats["interviews_list"]
-                state.hh_interview_neg_ids = stats.get("neg_ids", [])
-                state.hh_discard_neg_ids = set(str(x) for x in stats.get("discard_neg_ids", []))
-                state.hh_unread_by_employer = stats.get("unread_by_employer", 0)
-
-                for neg_id in state.hh_interview_neg_ids:
-                    upsert_interview(neg_id, acc=state.short, acc_color=state.color)
-                if len(state.hh_interview_neg_ids) == len(stats["interviews_list"]):
-                    for neg_id, item in zip(state.hh_interview_neg_ids, stats["interviews_list"]):
-                        parts = item.get("text", "").rsplit(" ", 1)
-                        upsert_interview(neg_id, acc=state.short, acc_color=state.color,
-                                         vacancy_title=item.get("text", ""))
+                if stats:
+                    self._apply_negotiation_stats(state, stats)
 
                 offers = get_client(state.acc).fetch_possible_offers()
                 state.hh_possible_offers = offers
@@ -3777,7 +4353,7 @@ class BotManager:
 
                 state.hh_stats_updated = datetime.now()
 
-                if old_interviews > 0 and stats["interview"] > old_interviews:
+                if stats and old_interviews > 0 and stats["interview"] > old_interviews:
                     new_count = stats["interview"] - old_interviews
                     self._add_log(
                         state.short, state.color,
@@ -3786,7 +4362,7 @@ class BotManager:
                     )
 
                 log_debug(
-                    f"HH stats {state.short}: {stats['interview']} интервью, "
+                    f"HH stats {state.short}: {state.hh_interviews} интервью, "
                     f"{rs['views']} просмотров резюме, {rs['new_invitations_total']} новых инвайтов"
                 )
 
@@ -3794,7 +4370,7 @@ class BotManager:
                 # существующих чатах. Так что limit-пауза НЕ должна стопать LLM.
                 # Стопаем только на manual паузу или auth (куки протухли — LLM
                 # всё равно не отправит).
-                _llm_skip = self.paused or (state.paused and state.paused_reason in ("manual", "auth"))
+                _llm_skip = self._stats_blocked(state)
                 if _llm_skip:
                     log_debug(f"LLM [{state.short}]: пропуск — на паузе (reason={state.paused_reason or 'global'})")
                     state.hh_stats_loading = False

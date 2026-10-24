@@ -14,6 +14,7 @@ from fastapi import APIRouter, Request
 from app.logging_utils import log_debug, _is_login_page
 from app.user_agent import webview_user_agent
 from app.hh_http import HH
+from app.cookie_parser import parse_cookies_str as _parse_cookies_str
 from app.config import (
     accounts_data,
     save_accounts,
@@ -23,8 +24,9 @@ from app.config import (
     normalize_experience_list,
     normalize_work_format_list,
     normalize_resume_filters,
+    _accounts_write_lock,
 )
-from app.storage import save_browser_sessions
+from app.storage import save_browser_sessions, _save_sessions_lock
 from app.oauth import (
     _obtain_oauth_token, _oauth_touch_resume,
     _oauth_tokens, _oauth_lock,
@@ -48,6 +50,18 @@ from app.instances import bot
 router = APIRouter()
 
 
+def _commit_edit(persistent, runtime, changes, saver, lock):
+    """A successful response means SQLite committed, not merely queued a job."""
+    with lock:
+        try:
+            saver((persistent, changes))
+        except Exception:
+            return {"ok": False, "error": "Не удалось записать настройки в БД. Изменения отменены."}
+        persistent.update(changes)
+        runtime.update(changes)
+    return {"ok": True}
+
+
 @router.patch("/api/account/{idx}/resume_filters")
 async def api_account_resume_filters(idx: int, request: Request):
     """Save title/employer filters for one resume of one account/session."""
@@ -65,14 +79,16 @@ async def api_account_resume_filters(idx: int, request: Request):
     if 0 <= idx < len(bot.account_states):
         persistent = accounts_data[idx] if idx < len(accounts_data) else bot.account_states[idx].acc
         runtime = bot.account_states[idx].acc
-        saver = save_accounts
+        saver = lambda edit: save_accounts(wait=True, edit=edit)
+        lock = _accounts_write_lock
     else:
         temp_idx = idx - len(bot.account_states)
         if not (0 <= temp_idx < len(bot.temp_sessions)):
             return {"ok": False, "error": "Аккаунт не найден"}
         persistent = bot.temp_sessions[temp_idx]
         runtime = bot.temp_states[temp_idx].acc if temp_idx in bot.temp_states else persistent
-        saver = lambda: save_browser_sessions(bot.temp_sessions)
+        saver = lambda edit: save_browser_sessions(bot.temp_sessions, wait=True, edit=edit)
+        lock = _save_sessions_lock
 
     known_resumes = {
         str(item.get("hash") or "").strip()
@@ -90,6 +106,9 @@ async def api_account_resume_filters(idx: int, request: Request):
         existing = dict(profiles.get(resume_hash) or {})
         for key in RESUME_FILTER_KEYS:
             if key in raw_filters:
+                if raw_filters[key] is None:
+                    existing.pop(key, None)  # explicitly restore inheritance
+                    continue
                 existing[key] = (
                     normalize_experience_list(raw_filters[key])
                     if key == "experience"
@@ -102,9 +121,9 @@ async def api_account_resume_filters(idx: int, request: Request):
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
 
-    persistent["resume_filters"] = profiles
-    runtime["resume_filters"] = profiles
-    saver()
+    result = _commit_edit(persistent, runtime, {"resume_filters": profiles}, saver, lock)
+    if not result["ok"]:
+        return result
     return {"ok": True, "resume_hash": resume_hash, "filters": existing}
 
 @router.put("/api/account/{idx}/active_resume")
@@ -118,20 +137,22 @@ async def api_account_active_resume(idx: int, request: Request):
     if 0 <= idx < len(bot.account_states):
         acc = bot.account_states[idx].acc
         persistent = accounts_data[idx] if idx < len(accounts_data) else acc
-        saver = save_accounts
+        saver = lambda edit: save_accounts(wait=True, edit=edit)
+        lock = _accounts_write_lock
     else:
         temp_idx = idx - len(bot.account_states)
         if not (0 <= temp_idx < len(bot.temp_sessions)):
             return {"ok": False, "error": "Аккаунт не найден"}
         persistent = bot.temp_sessions[temp_idx]
         acc = bot.temp_states[temp_idx].acc if temp_idx in bot.temp_states else persistent
-        saver = lambda: save_browser_sessions(bot.temp_sessions)
+        saver = lambda edit: save_browser_sessions(bot.temp_sessions, wait=True, edit=edit)
+        lock = _save_sessions_lock
     allowed = {str(r.get("hash") or "") for r in persistent.get("all_resumes") or [] if isinstance(r, dict)}
     if not resume_hash or resume_hash not in allowed:
         return {"ok": False, "error": "Резюме не принадлежит аккаунту"}
-    persistent["resume_hash"] = resume_hash
-    acc["resume_hash"] = resume_hash
-    saver()
+    result = _commit_edit(persistent, acc, {"resume_hash": resume_hash}, saver, lock)
+    if not result["ok"]:
+        return result
     return {"ok": True, "resume_hash": resume_hash}
 
 
@@ -144,58 +165,6 @@ _AUTH_COOKIE_KEYS = {
     "hhtoken", "_xsrf", "hhul", "crypted_id", "iap.uid",
     "hhrole", "regions", "GMT", "hhuid", "crypted_hhuid",
 }
-
-
-def _parse_cookies_str(raw: str) -> tuple:
-    """
-    Парсит cURL-запрос, 'Cookie: ...' или просто 'key=val; key2=val2'.
-    Возвращает (cookies_dict, raw_cookie_line).
-    """
-    raw = raw.strip()
-    raw_line = ""
-
-    raw = raw.encode().decode('unicode_escape', errors='replace') if '\\u00' in raw else raw
-
-    if raw.startswith("curl "):
-        # `\$?` — bash $'...' ANSI-C quoting (Firefox Copy-as-cURL для cookies с спецсимволами).
-        m = re.search(r"-H\s+\$?['\"](?:C|c)ookie:\s*([^'\"]+)['\"]", raw, re.DOTALL)
-        if not m:
-            m = re.search(r"-b\s+\$?['\"]([^'\"]+)['\"]", raw, re.DOTALL)
-        if not m:
-            m = re.search(r"--cookie\s+\$?['\"]([^'\"]+)['\"]", raw, re.DOTALL)
-        if m:
-            raw_line = m.group(1).strip()
-        else:
-            return {}, ""
-    elif raw.lower().startswith("cookie:"):
-        raw_line = raw[7:].strip()
-    else:
-        raw_line = raw
-
-    # bash $'...' декодирует \NNN (octal), \xNN, \n и т.д. — повторяем то же.
-    # Firefox Copy-as-cURL генерит $'...' когда cookie содержит спецсимволы (например ! → \041).
-    if "\\" in raw_line:
-        try:
-            raw_line = raw_line.encode("utf-8").decode("unicode_escape")
-        except (UnicodeDecodeError, UnicodeEncodeError):
-            pass
-
-    cookies: dict = {}
-    for part in raw_line.split(";"):
-        part = part.strip()
-        if "=" in part:
-            k, v = part.split("=", 1)
-            # Stripping NUL и control chars (CRLF) — иначе header injection
-            # или requests/http.client крашится навсегда на этой сессии (kimi-search-3 #5,#8).
-            k = k.strip()
-            v = "".join(ch for ch in v.strip() if ch == "\t" or 0x20 <= ord(ch) < 0x7f or ord(ch) >= 0xa0)
-            # Если после strip значение пустое — не добавляем,
-            # иначе downstream `hhtoken in cookies` проходит, а реально auth-token нет (r10-1 #4,#9).
-            if not v:
-                continue
-            cookies[k] = v
-
-    return cookies, raw_line
 
 
 # ============================================================
@@ -214,6 +183,11 @@ async def api_account_pause(idx: int):
     return {"paused": paused}
 
 
+@router.post("/api/account/{idx}/run_now")
+async def api_account_run_now(idx: int):
+    return bot.request_account_cycle(idx)
+
+
 @router.post("/api/account/{idx}/llm_toggle")
 async def api_account_llm_toggle(idx: int):
     bot.toggle_account_llm(idx)
@@ -228,8 +202,10 @@ async def api_account_llm_toggle(idx: int):
 
 @router.post("/api/account/{idx}/resume_touch")
 async def api_resume_touch(idx: int):
+    if bot._get_apply_state(idx) is None:
+        return {"ok": False, "error": "Активный профиль не найден"}
     bot.trigger_resume_touch(idx)
-    return {"ok": True}
+    return {"ok": True, "queued": True}
 
 
 @router.get("/api/account/{idx}/diagnostics")
@@ -367,9 +343,15 @@ async def api_set_urls(idx: int, request: Request):
             pass
     fallback_short = (body.get("short") or "").strip()
     fallback_name = (body.get("name") or "").strip()
+    source_mode = body.get("search_source_mode", "selected")
+    if source_mode not in ("selected", "inherit"):
+        return {"ok": False, "error": "Неизвестный источник поиска"}
 
     def _apply_optional_filters(target: dict) -> None:
         """Apply per-account filters when the caller explicitly sends them."""
+        target["search_source_mode"] = source_mode
+        if "include_saved_searches" in body:
+            target["include_saved_searches"] = bool(body["include_saved_searches"])
         for key in (
             "title_include_keywords",
             "title_exclude_keywords",
@@ -379,29 +361,39 @@ async def api_set_urls(idx: int, request: Request):
             if key in body and isinstance(value, list):
                 target[key] = [str(item).strip() for item in value if str(item).strip()]
 
+    def _settings(acc):
+        return {"urls": sorted(acc.get("urls") or []), "url_pages": acc.get("url_pages") or {},
+                "search_source_mode": acc.get("search_source_mode") or ("selected" if acc.get("urls") else "inherit"),
+                "include_saved_searches": acc.get("include_saved_searches") is not False}
+
+    def _apply(persistent, runtime, saver, lock):
+        with lock:
+            if body.get("expected_resume_hash") is not None and body["expected_resume_hash"] != persistent.get("resume_hash", ""):
+                return {"ok": False, "error": "Профиль изменился. Обновите страницу."}
+            if "base_settings" in body and body["base_settings"] != _settings(persistent):
+                return {"ok": False, "conflict": True, "error": "Поиски изменены в другом окне. Загрузите актуальные настройки перед сохранением."}
+            changes = {"urls": urls, "url_pages": url_pages}
+            _apply_optional_filters(changes)
+            result = _commit_edit(persistent, runtime, changes, saver, lock)
+            if result["ok"]:
+                result.update(count=len(urls), settings=_settings(persistent))
+            return result
+
     def _apply_regular(i: int) -> dict:
-        bot.account_states[i].acc["urls"] = urls
-        bot.account_states[i].acc["url_pages"] = url_pages
-        _apply_optional_filters(bot.account_states[i].acc)
-        bot.account_states[i].total_urls = len(urls)
-        if 0 <= i < len(accounts_data):
-            accounts_data[i]["urls"] = urls
-            accounts_data[i]["url_pages"] = url_pages
-            _apply_optional_filters(accounts_data[i])
-            save_accounts()
-        return {"ok": True, "count": len(urls), "matched": "regular", "idx": i}
+        state = bot.account_states[i]
+        persistent = accounts_data[i] if i < len(accounts_data) else state.acc
+        result = _apply(persistent, state.acc, lambda edit: save_accounts(wait=True, edit=edit), _accounts_write_lock)
+        if result["ok"]:
+            state.total_urls = len(urls)
+        return {**result, "matched": "regular", "idx": i}
 
     def _apply_temp(ti: int) -> dict:
-        bot.temp_sessions[ti]["urls"] = urls
-        bot.temp_sessions[ti]["url_pages"] = url_pages
-        _apply_optional_filters(bot.temp_sessions[ti])
-        if ti in bot.temp_states:
-            bot.temp_states[ti].acc["urls"] = urls
-            bot.temp_states[ti].acc["url_pages"] = url_pages
-            _apply_optional_filters(bot.temp_states[ti].acc)
+        persistent = bot.temp_sessions[ti]
+        runtime = bot.temp_states[ti].acc if ti in bot.temp_states else persistent
+        result = _apply(persistent, runtime, lambda edit: save_browser_sessions(bot.temp_sessions, wait=True, edit=edit), _save_sessions_lock)
+        if result["ok"] and ti in bot.temp_states:
             bot.temp_states[ti].total_urls = len(urls)
-        save_browser_sessions(bot.temp_sessions)
-        return {"ok": True, "count": len(urls), "matched": "temp", "temp_idx": ti}
+        return {**result, "matched": "temp", "temp_idx": ti}
 
     # 1. Strict idx match — regular
     if 0 <= idx < len(bot.account_states):
@@ -438,18 +430,14 @@ async def api_set_letter(idx: int, request: Request):
     body = await request.json()
     letter = body.get("letter", "")
     if 0 <= idx < len(bot.account_states):
-        bot.account_states[idx].acc["letter"] = letter
-        if 0 <= idx < len(accounts_data):
-            accounts_data[idx]["letter"] = letter
-            save_accounts()
-        return {"ok": True}
+        runtime = bot.account_states[idx].acc
+        persistent = accounts_data[idx] if idx < len(accounts_data) else runtime
+        return _commit_edit(persistent, runtime, {"letter": letter}, lambda edit: save_accounts(wait=True, edit=edit), _accounts_write_lock)
     temp_idx = idx - len(bot.account_states)
     if 0 <= temp_idx < len(bot.temp_sessions):
-        bot.temp_sessions[temp_idx]["letter"] = letter
-        if temp_idx in bot.temp_states:
-            bot.temp_states[temp_idx].acc["letter"] = letter
-        save_browser_sessions(bot.temp_sessions)
-        return {"ok": True}
+        persistent = bot.temp_sessions[temp_idx]
+        runtime = bot.temp_states[temp_idx].acc if temp_idx in bot.temp_states else persistent
+        return _commit_edit(persistent, runtime, {"letter": letter}, lambda edit: save_browser_sessions(bot.temp_sessions, wait=True, edit=edit), _save_sessions_lock)
     return {"ok": False, "error": "Аккаунт не найден"}
 
 
@@ -921,6 +909,22 @@ async def api_hot_leads(idx: int):
     acc = bot._get_apply_acc(idx)
     if acc is None:
         return {"ok": False, "error": "Invalid idx"}
+    if _is_mobile_acc(acc):
+        # Mobile-профиль: через mobile API, без веб-cookies (раньше было HTTP 406).
+        try:
+            client = get_client(acc)
+            raw = await asyncio.get_event_loop().run_in_executor(None, client.fetch_possible_offers)
+            offers = [{
+                "employer": o.get("name", "?"),
+                "employer_id": o.get("employerId") or None,
+                "vacancies": o.get("vacancyNames", []),
+                "vacancy_id": o.get("vacancyId", ""),
+                "has_invitation": False,
+                "topic_ids": [],
+            } for o in (raw or [])]
+            return {"offers": offers, "total": len(offers)}
+        except Exception as e:
+            return {"offers": [], "error": str(e)}
     try:
         r = HH.get(
             hh_base() + "/shards/applicant/negotiations/possible_job_offers",
@@ -1129,12 +1133,50 @@ async def api_edit_resume(idx: int, request: Request):
     return result
 
 
+def _is_mobile_acc(acc: dict) -> bool:
+    return str(acc.get("mode", "")).strip().lower() in ("mobile", "oauth")
+
+
+def _mobile_all_resumes(acc: dict) -> dict:
+    """Список резюме mobile-профиля через OAuth /resumes/mine (веб-cookies не нужны)."""
+    from app.hh_mobile_transport import mobile_request
+    data = mobile_request(acc, "GET", "/resumes/mine", params={"per_page": 30})
+    items = (data or {}).get("items", []) if isinstance(data, dict) else []
+    resumes = []
+    for res in items:
+        if not isinstance(res, dict):
+            continue
+        rid = str(res.get("id") or "")
+        status = res.get("status") or {}
+        resumes.append({
+            "hash": rid,
+            "title": res.get("title") or "(без заголовка)",
+            "status": status.get("id", "") if isinstance(status, dict) else str(status),
+            "percent": 0,
+            "is_searchable": not bool(res.get("blocked")) and (status.get("id") if isinstance(status, dict) else "") == "published",
+            "can_publish": bool(res.get("can_publish_or_update")),
+            "updated": res.get("updated_at"),
+            "skills_count": None,
+            "experience_count": None,
+            "views_7d": int(res.get("new_views") or 0),
+            "shows_7d": 0,
+            "edit_url": f"https://hh.ru/resume/edit/{rid}/position",
+        })
+    return {"resumes": resumes, "total": len(resumes), "source": "mobile"}
+
+
 @router.get("/api/account/{idx}/all_resumes")
 async def api_all_resumes(idx: int):
     """List all resumes for this account (including clones). Uses HTML page for full data."""
     acc = bot._get_apply_acc(idx)
     if acc is None:
         return {"ok": False, "error": "Invalid idx"}
+    if _is_mobile_acc(acc):
+        try:
+            return await asyncio.get_event_loop().run_in_executor(None, _mobile_all_resumes, acc)
+        except Exception as e:
+            log_debug(f"mobile all_resumes [{idx}]: {e}")
+            # падаем в web-путь ниже: вдруг cookies живые
     ua = webview_user_agent()
     try:
         r = HH.get(

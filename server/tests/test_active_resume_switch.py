@@ -19,7 +19,7 @@ def test_put_switches_temp_active_resume(monkeypatch):
         bot.temp_sessions[:] = [{"resume_hash": "r1", "all_resumes": [{"hash": "r1"}, {"hash": "r2"}]}]
         bot.temp_states.clear()
         bot.temp_states[0] = SimpleNamespace(acc={"resume_hash": "r1"})
-        monkeypatch.setattr("app.routes.accounts.save_browser_sessions", lambda value: saved.append(value))
+        monkeypatch.setattr("app.routes.accounts.save_browser_sessions", lambda value, **kw: saved.append(value))
         result = asyncio.run(api_account_active_resume(0, Request()))
         assert result == {"ok": True, "resume_hash": "r2"}
         assert bot.temp_sessions[0]["resume_hash"] == "r2"

@@ -183,7 +183,7 @@ ACC = {
 def bot_stub(monkeypatch):
     """Подменяет bot-хелперы и add_applied шпионами (без диска и сети)."""
     acc = dict(ACC)
-    state = types.SimpleNamespace(sent=0, questionnaire_sent=0, short="a1", color="green")
+    state = types.SimpleNamespace(name="acc1", sent=0, daily_sent=0, questionnaire_sent=0, short="a1", color="green", _state_lock=threading.Lock())
     logs: list = []
     applied: list = []
     monkeypatch.setattr(bot, "_get_apply_acc", lambda idx: dict(acc))

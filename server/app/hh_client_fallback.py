@@ -11,7 +11,9 @@ FallbackHHClient — auto-fallback обёртка mobile → web (Phase 2).
 Правила делегирования (одинаковы для КАЖДОГО метода полного контракта
 HHClient, включая async submit_response/fill_questionnaire):
 - mobile вернул значение → возвращаем его, web НЕ вызывается;
-- MobileAPIError со fallback-статусом → log_debug + вызов web;
+- MobileAPIError со fallback-статусом → log_debug + вызов web для чтения;
+- неоднозначная ошибка отправки отклика/анкеты (сеть/5xx) → ручная
+  проверка результата, без автоматической повторной отправки через web;
 - MobileAPIError с прочим статусом (400/404/409/...) → перекидываем как есть;
 - NotImplementedError из mobile (метод там не реализован, заглушка
   "phase N: TODO") → сразу вызов web (например, fill_questionnaire —
@@ -138,6 +140,8 @@ def _make_async_delegate(name: str):
         except MobileAPIError as e:
             if not is_fallback_status(e.status_code):
                 raise
+            if name in ("submit_response", "fill_questionnaire") and (e.status_code == 0 or e.status_code >= 500):
+                return "error", {"review_required": True, "http_status": e.status_code}
             log_debug(
                 f"FallbackHHClient.{name}: mobile HTTP {e.status_code} — "
                 f"повторяю через web-flow"

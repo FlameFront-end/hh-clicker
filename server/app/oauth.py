@@ -898,6 +898,16 @@ def fetch_vacancy_details(acc: dict, vid: str) -> dict:
             ],
             "response_letter_required": bool(d.get("response_letter_required")),
             "billing_type": (d.get("billing_type") or {}).get("id", ""),
+            # Поля карточки поиска — нужны, чтобы вакансии из «Избранного» и
+            # «Похожих» (приходят только id) прошли фильтры и попали в очередь.
+            "title": d.get("name") or "",
+            "experience": (d.get("experience") or {}).get("id", ""),
+            "company": emp.get("name") or "",
+            "published_at": d.get("published_at") or d.get("created_at") or "",
+            "has_test": bool(d.get("has_test")),
+            "archived": bool(d.get("archived")),
+            "salary": d.get("salary") if isinstance(d.get("salary"), dict) else None,
+            "schedule": ((d.get("schedule") or {}).get("id") or ""),
         }
     except Exception as e:
         log_debug(f"vacancy_details({vid}) error: {e}")
@@ -1047,16 +1057,21 @@ def _oauth_apply(acc: dict, vid: str, message: str = "") -> tuple:
     """Apply to vacancy via OAuth API. Returns (result_str, info_dict)."""
     from app.llm import _randomize_text
     from app.captcha import captcha_info
+    from app.dispatch import dispatch_allowed
     token = _obtain_oauth_token(acc)
     if not token:
         return "error", {"exception": "OAuth token не получен"}
     resume_hash = acc.get("resume_hash", "")
+    post_started = False
     try:
         message = _randomize_text(message) if message else message
         resume_hash_quoted = urllib.parse.quote(resume_hash, safe="")
         data = {"vacancy_id": vid, "resume_id": resume_hash_quoted}
         if message:
             data["message"] = message
+        if not dispatch_allowed(acc):
+            return "cancelled", {}
+        post_started = True
         r = HH.post(
             "https://api.hh.ru/negotiations",
             headers={"User-Agent": _mobile_user_agent(), "Authorization": f"Bearer {token}",
@@ -1127,7 +1142,7 @@ def _oauth_apply(acc: dict, vid: str, message: str = "") -> tuple:
                 return "test", {}
             return "error", {"raw": raw, "http_status": 403}
         elif r.status_code == 404:
-            return "error", {"raw": "Вакансия не найдена"}
+            return "error", {"raw": "Вакансия не найдена", "http_status": 404}
         elif r.status_code == 429:
             # Rate-limit от HH — не считаем permanent error (раньше manager
             # auto-pause'ил account на 429 как на consecutive_errors).
@@ -1136,13 +1151,15 @@ def _oauth_apply(acc: dict, vid: str, message: str = "") -> tuple:
                 retry_after = int(r.headers.get("Retry-After", "0"))
             except (ValueError, TypeError):
                 pass
-            return "limit", {"retry_after": retry_after}
+            # Это ограничение частоты, а не дневной лимит: менеджер делает
+            # короткую паузу вместо остановки до полуночи.
+            return "limit", {"retry_after": retry_after, "rate_limited": True}
         elif r.status_code in (502, 503, 504):
-            return "error", {"raw": f"HH transient {r.status_code}", "transient": True}
+            return "error", {"raw": f"HH transient {r.status_code}", "transient": True, "review_required": True}
         else:
             return "error", {"raw": f"HTTP {r.status_code}: {r.text[:100]}"}
     except Exception as e:
-        return "error", {"exception": str(e)}
+        return "error", {"exception": str(e), "review_required": post_started}
 
 
 def _oauth_touch_resume(acc: dict) -> tuple:
@@ -1216,6 +1233,7 @@ def send_negotiation_message_oauth(acc: dict, neg_id, text: str) -> bool:
     `send_chat_message_oauth` (которая работает через /common/chats).
     Бот выбирает этот путь когда у нас есть neg_id (а не chat_id) и/или
     в degraded mode. Возвращает True/False."""
+    from app.dispatch import MessageSendUncertain
     if not neg_id:
         return False
     H = _oauth_headers(acc)
@@ -1230,6 +1248,8 @@ def send_negotiation_message_oauth(acc: dict, neg_id, text: str) -> bool:
         log_debug(f"OAuth /negotiations send neg={neg_id}: HTTP {r.status_code} | {r.text[:200]}")
         if r.status_code in (200, 201, 204):
             return True
+        if r.status_code >= 500:
+            raise MessageSendUncertain("OAuth message result is unknown")
         if r.status_code == 401 or (r.status_code == 403 and _is_403_auth_related(r)):
             # 401 = auth failure → invalidate + lazy refresh.
             # 403 бывает и auth-related (revoked token, expired scope), и
@@ -1239,9 +1259,11 @@ def send_negotiation_message_oauth(acc: dict, neg_id, text: str) -> bool:
             if rh:
                 invalidate_oauth_token(rh, acc)
         return False
+    except MessageSendUncertain:
+        raise
     except Exception as e:
         log_debug(f"OAuth /negotiations send neg={neg_id} error: {e}")
-        return False
+        raise MessageSendUncertain("OAuth message response lost") from e
 
 
 def send_chat_message_oauth(acc: dict, chat_id, text: str, is_automated: bool = False):
@@ -1257,6 +1279,7 @@ def send_chat_message_oauth(acc: dict, chat_id, text: str, is_automated: bool = 
     - Используется тот же chat_id что и chatik (числовой ID)
     """
     import uuid as _uuid
+    from app.dispatch import MessageSendUncertain
     token = _obtain_oauth_token(acc)
     if not token:
         return "no_token"
@@ -1285,6 +1308,8 @@ def send_chat_message_oauth(acc: dict, chat_id, text: str, is_automated: bool = 
         log_debug(f"OAuth chat send chat_id={cid}: HTTP {r.status_code} | {r.text[:300]}")
         if r.status_code in (200, 201, 204):
             return True
+        if r.status_code >= 500:
+            raise MessageSendUncertain("OAuth chat message result is unknown")
         if r.status_code == 404:
             return "chat_not_found"
         if r.status_code == 401 or (r.status_code == 403 and _is_403_auth_related(r)):
@@ -1319,9 +1344,11 @@ def send_chat_message_oauth(acc: dict, chat_id, text: str, is_automated: bool = 
                 return "chat_not_found"
             return False
         return False
+    except MessageSendUncertain:
+        raise
     except Exception as e:
         log_debug(f"OAuth chat send chat_id={cid} error: {e}")
-        return False
+        raise MessageSendUncertain("OAuth chat message response lost") from e
 
 
 def fetch_negotiations_statistic(acc: dict) -> dict:

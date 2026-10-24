@@ -240,6 +240,10 @@ class HHClient:
                 # иначе cross-account cookie confusion сохраняется).
                 _record_diag(method, url, -1, str(e).encode("utf-8"), {},
                              tag="cffi_error", extra={"exc": str(e)})
+                # A lost response does not prove that a state-changing request
+                # failed. Never silently send the same POST through requests.
+                if method.upper() not in ("GET", "HEAD", "OPTIONS"):
+                    raise
 
         r = sess_req.request(method, url, **kwargs)
         tag = _classify(r.status_code, r.content or b"", dict(r.headers or {}))

@@ -4,6 +4,7 @@ Manual vacancy apply flow (two-step: check + submit).
 
 import json
 import re
+from datetime import datetime
 
 import aiohttp
 from fastapi import APIRouter
@@ -11,7 +12,8 @@ from glom import glom
 
 from app.logging_utils import _is_login_page
 from app.config import hh_base
-from app.storage import add_applied
+from app.storage import add_applied, is_applied
+from app.hh_apply import classify_apply_response
 from app.hh_api import get_headers
 from app.hh_client_factory import get_client
 from app.hh_client_fallback import FallbackHHClient
@@ -135,6 +137,7 @@ async def _mobile_submit_response(acc_idx: int, acc: dict, vid: str, client) -> 
         state = bot._get_apply_state(acc_idx)
         if state:
             state.sent += 1
+            state.daily_sent = getattr(state, "daily_sent", 0) + 1
             # state.questionnaire_sent НЕ инкрементируем — анкеты не было
         add_applied(acc["name"], vid)
         short = state.short if state else acc.get("name", "?")
@@ -195,31 +198,27 @@ async def api_apply_check(body: dict):
                 txt = await r.text()
                 status_code = r.status
 
-        if status_code in (401, 403) or (status_code == 200 and _is_login_page(txt)):
-            return {"status": "error", "vacancy_id": vid, "message": "⚠️ Куки протухли — обновите в настройках"}
-
-        if status_code == 200:
-            info = {}
-            if "shortVacancy" in txt:
-                try:
-                    p = json.loads(txt)
-                    info = {
-                        "title": glom(p, "responseStatus.shortVacancy.name", default=""),
-                        "company": glom(p, "responseStatus.shortVacancy.company.name", default=""),
-                    }
-                except Exception:
-                    pass
-            return {"status": "sent", "vacancy_id": vid, **info,
-                    "message": "Отклик уже отправлен (без опроса)"}
-
-        if "negotiations-limit-exceeded" in txt:
-            return {"status": "limit", "vacancy_id": vid, "message": "Достигнут дневной лимит откликов"}
-
-        if "alreadyApplied" in txt:
-            return {"status": "already", "vacancy_id": vid, "message": "Отклик на эту вакансию уже был отправлен"}
-
-        if "test-required" in txt:
+        result, info = classify_apply_response(status_code, txt)
+        if result == "sent":
+            # The check endpoint can submit a test-free response. Count it
+            # exactly like submit, but only after an explicit HH confirmation.
+            if not is_applied(acc["name"], vid):
+                add_applied(acc["name"], vid, info)
+                state = bot._get_apply_state(acc_idx)
+                if state:
+                    with state._state_lock:
+                        state.sent += 1
+                        state.daily_sent += 1
+                        state.last_apply_at = datetime.now().isoformat(timespec="seconds")
+                    bot._add_response(state, vid, info.get("title", ""), info.get("company", ""), "sent")
+            return {**_result_to_response(result, info, vid),
+                    "title": info.get("title", ""), "company": info.get("company", "")}
+        if result == "already":
+            add_applied(acc["name"], vid, info, confirmed=False)
+        if result == "test":
             qdata = await _fetch_questionnaire_data(acc, vid)
+            if qdata.get("error"):
+                return {"status": "error", "vacancy_id": vid, "message": "Не удалось загрузить опрос: проверьте авторизацию"}
             return {
                 "status": "test_required",
                 "vacancy_id": vid,
@@ -228,7 +227,7 @@ async def api_apply_check(body: dict):
                 "message": f"Вакансия требует опрос ({len(qdata['questions'])} вопросов)",
             }
 
-        return {"status": "error", "vacancy_id": vid, "message": f"HTTP {status_code}: {txt[:100]}"}
+        return _result_to_response(result, info, vid)
 
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -328,6 +327,7 @@ async def api_apply_submit(body: dict):
             state = bot._get_apply_state(acc_idx)
             if state:
                 state.sent += 1
+                state.daily_sent = getattr(state, "daily_sent", 0) + 1
                 state.questionnaire_sent += 1
             add_applied(acc["name"], vid)
             short = state.short if state else acc.get("name", "?")

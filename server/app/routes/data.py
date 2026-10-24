@@ -4,13 +4,14 @@ Data query routes: applied, tests, interviews, vacancies, HR contacts.
 
 import threading
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 from app.storage import (
     _load_cache, _cache_applied, _cache_tests, _cache_lock,
     get_applied_list, get_vacancy_db, get_test_list,
     get_interviews_list,
     _save_applied_async, _save_tests_async,
+    resolve_review,
 )
 from app.instances import bot
 
@@ -26,6 +27,26 @@ async def api_applied(limit: int = 300):
 @router.get("/api/tests")
 async def api_tests(limit: int = 300):
     return get_test_list(limit)
+
+
+@router.post("/api/tests/{vacancy_id}/resolve")
+async def api_resolve_review(vacancy_id: str, request: Request):
+    body = await request.json()
+    if body.get("confirmed_not_sent") is not True:
+        return {"ok": False, "error": "Сначала проверьте отсутствие отклика на HH."}
+    account = str(body.get("account_name") or "")
+    resume = str(body.get("resume_hash") or "")
+    try:
+        resolved = resolve_review(vacancy_id, account, resume, body.get("expected_at"))
+    except Exception:
+        return {"ok": False, "error": "Не удалось сохранить решение. Блокировка оставлена."}
+    if not resolved:
+        return {"ok": False, "error": "Запись уже изменилась. Обновите список."}
+    # Clear only the local retry backoff. Protective account pauses remain.
+    for state in [*bot.account_states, *bot.temp_states.values()]:
+        if state.acc.get("name") == account:
+            state._test_failures.pop(vacancy_id, None)
+    return {"ok": True}
 
 
 @router.get("/api/interviews")

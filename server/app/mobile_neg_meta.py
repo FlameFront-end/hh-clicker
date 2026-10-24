@@ -118,9 +118,15 @@ def fetch_possible_offers(acc: dict) -> list:
         if not isinstance(vacancies, list):
             single = item.get("vacancy")
             vacancies = [single] if isinstance(single, dict) else []
+        vacancy_ids = [str(v.get("id")) for v in vacancies
+                       if isinstance(v, dict) and v.get("id")]
         offers.append({
             "name": item.get("name", ""),
             "vacancyNames": [v.get("name", "") for v in vacancies
                              if isinstance(v, dict)],
+            # id нужны для приоритета «горячих лидов» в очереди откликов и для UI.
+            "vacancyIds": vacancy_ids,
+            "vacancyId": vacancy_ids[0] if vacancy_ids else "",
+            "employerId": str(item.get("id") or item.get("employer_id") or ""),
         })
     return offers

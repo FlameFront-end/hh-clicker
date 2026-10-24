@@ -94,7 +94,9 @@ def pick_suitable_resume(acc: dict, vacancy_id: str,
     """
     default_resume_id = str(default_resume_id or acc.get("resume_hash") or "")
     all_resumes = acc.get("all_resumes") or []
-    if not CONFIG.auto_pick_resume or len(all_resumes) <= 1:
+    # Worker queues were filtered for this exact resume. Automatic selection
+    # must not silently replace it after those checks (manual tools may opt in).
+    if "_dispatch_guard" in acc or not CONFIG.auto_pick_resume or len(all_resumes) <= 1:
         return default_resume_id
     data = get_suitable_resumes(acc, str(vacancy_id))
     suitable = data.get("suitable") if isinstance(data, dict) else None

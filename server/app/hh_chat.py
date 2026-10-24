@@ -446,10 +446,11 @@ def send_negotiation_message(acc: dict, neg_id: str, text: str, topic_id: str = 
     Если CONFIG.chat_use_oauth — сначала пробуем ОФИЦИАЛЬНЫЙ путь
     `POST api.hh.ru/common/chats/{chat_id}/messages` через OAuth Bearer.
     Это ToS-compliant и помечает сообщение `is_automated: true`.
-    На любую ошибку OAuth (нет токена/403/network) — fallback на
-    reverse-engineered chatik.hh.ru/chatik/api/send (старый working путь).
+    Fallback разрешён только при однозначном отказе. Timeout/5xx требует
+    проверки результата, а не повторного POST через другой endpoint.
     """
     import uuid as _uuid
+    from app.dispatch import MessageSendUncertain
     ua = webview_user_agent()
 
     # OAuth-first path. Degraded mode forces OAuth (cookies dead).
@@ -464,6 +465,8 @@ def send_negotiation_message(acc: dict, neg_id: str, text: str, topic_id: str = 
                 if _oauth_neg_send(acc, neg_id, text):
                     return True
                 log_debug(f"OAuth /negotiations send neg={neg_id} → False, пробую /common/chats")
+            except MessageSendUncertain:
+                raise
             except Exception as _e:
                 log_debug(f"OAuth /negotiations send neg={neg_id} exception: {_e}")
             # 2) /common/chats/{chat_id}/messages — fallback (предполагает chat_id == neg_id)
@@ -478,8 +481,12 @@ def send_negotiation_message(acc: dict, neg_id: str, text: str, topic_id: str = 
                     log_debug(f"OAuth chat send neg={neg_id}: нет токена, fallback на chatik")
                 else:
                     log_debug(f"OAuth chat send neg={neg_id}: result={_r!r}, fallback на chatik")
+            except MessageSendUncertain:
+                raise
             except Exception as _e:
                 log_debug(f"OAuth chat send neg={neg_id} exception: {_e}, fallback на chatik")
+    except MessageSendUncertain:
+        raise
     except Exception:
         pass
 
@@ -506,6 +513,8 @@ def send_negotiation_message(acc: dict, neg_id: str, text: str, topic_id: str = 
         log_debug(f"send via chatik/api/send {neg_id}: HTTP {resp.status_code} | {resp.text[:300]}")
         if resp.status_code in (200, 201, 204):
             return True
+        if resp.status_code >= 500:
+            raise MessageSendUncertain("Chatik message result is unknown")
         if resp.status_code == 409:
             try:
                 body_json = resp.json()
@@ -538,9 +547,11 @@ def send_negotiation_message(acc: dict, neg_id: str, text: str, topic_id: str = 
                 return False
             return False
         return False
+    except MessageSendUncertain:
+        raise
     except Exception as e:
         log_debug(f"send_negotiation_message {neg_id} error: {e}")
-        return False
+        raise MessageSendUncertain("Chatik message response lost") from e
 
 
 # ── Chatik WebSocket push-канал ────────────────────────────────────────

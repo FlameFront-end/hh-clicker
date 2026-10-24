@@ -11,13 +11,57 @@ from fastapi import APIRouter, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from app.config import CONFIG, accounts_data, _CONFIG_KEYS, save_config, save_accounts
+from app.config import CONFIG, accounts_data, _CONFIG_KEYS, save_config, save_accounts, _config_write_lock, _url_entry
 from app.storage import load_browser_sessions, save_browser_sessions, DATA_DIR
 from app.logging_utils import log_debug
 from app.database import DOCUMENTS, STREAMS, read_document, export_bundle, restore_bundle, delete_document
 
 
 router = APIRouter()
+
+
+def _pool_entries(items):
+    if not isinstance(items, list):
+        raise ValueError("Нужен список поисковых ссылок")
+    out = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, (str, dict)):
+            raise ValueError("Некорректная поисковая ссылка")
+        entry = _url_entry(item)
+        if not entry["url"] or not 1 <= entry["pages"] <= 200:
+            raise ValueError("Укажите ссылку и глубину от 1 до 200 страниц")
+        if entry["url"] not in seen:
+            out.append(entry)
+            seen.add(entry["url"])
+    return out
+
+
+@router.post("/api/search-pool")
+async def api_search_pool(request: Request):
+    """Atomic add; full replacement requires the exact base the editor saw."""
+    try:
+        body = await request.json()
+        entries = _pool_entries(body.get("urls"))
+        action = body.get("action")
+        if action not in ("add", "replace"):
+            raise ValueError("Неизвестное действие с пулом")
+        with _config_write_lock:
+            current = _pool_entries(CONFIG.url_pool)
+            if action == "replace":
+                if "base_urls" not in body or _pool_entries(body["base_urls"]) != current:
+                    return {"ok": False, "conflict": True, "error": "Пул изменён в другом окне. Загрузите актуальные ссылки перед сохранением."}
+                next_pool = entries
+            else:
+                existing = {item["url"] for item in current}
+                next_pool = current + [item for item in entries if item["url"] not in existing]
+            try:
+                save_config(wait=True, updates={"url_pool": next_pool})
+            except Exception:
+                return {"ok": False, "error": "Не удалось записать пул в БД. Изменения отменены."}
+            return {"ok": True, "urls": next_pool, "added": len(next_pool) - len(current) if action == "add" else 0}
+    except (ValueError, TypeError, AttributeError):
+        return {"ok": False, "error": "Некорректный список поисков: нужны URL и глубина 1–200."}
 
 
 def _reload_database_caches():

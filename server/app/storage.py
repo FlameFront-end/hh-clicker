@@ -310,7 +310,7 @@ def upsert_interview(neg_id: str, acc: str, acc_color: str = "",
         if len(_cache_interviews) > _INTERVIEWS_MAX:
             protected = {
                 nid for nid, r in _cache_interviews.items()
-                if r.get("llm_sent") and r.get("replied_msg_id")
+                if (r.get("llm_sent") and r.get("replied_msg_id")) or r.get("uncertain_msg_ids")
             }
             candidates = [
                 (r.get("last_seen", ""), nid)
@@ -321,6 +321,32 @@ def upsert_interview(neg_id: str, acc: str, acc_color: str = "",
             for _, nid in candidates[:_INTERVIEWS_EVICT]:
                 del _cache_interviews[nid]
     _schedule_save(_save_interviews_async)
+
+
+def hold_message_for_review(neg_id: str, msg_id: str, acc: str) -> None:
+    """Persist an uncertain send without falsely reporting successful delivery."""
+    global _interviews_mut_seq
+    _load_cache()
+    neg_id, msg_id = str(neg_id), str(msg_id)
+    with _save_interviews_lock, _cache_lock:
+        record = copy.deepcopy(_cache_interviews.get(neg_id, {}))
+        record.update(neg_id=neg_id, acc=acc, llm_send_review_required=True,
+                      last_seen=datetime.now().isoformat(timespec="seconds"))
+        held = set(record.get("uncertain_msg_ids") or [])
+        held.add(msg_id)
+        record["uncertain_msg_ids"] = sorted(held)
+        snapshot = dict(_cache_interviews)
+        snapshot[neg_id] = record
+        _atomic_write_json(INTERVIEWS_FILE, snapshot)
+        _cache_interviews[neg_id] = record
+        _interviews_mut_seq += 1
+
+
+def is_message_review_pending(neg_id: str, msg_id: str) -> bool:
+    _load_cache()
+    with _cache_lock:
+        record = _cache_interviews.get(str(neg_id), {})
+        return str(msg_id) in (record.get("uncertain_msg_ids") or [])
 
 
 def get_no_chat_neg_ids(since: datetime = None) -> set:
@@ -348,6 +374,8 @@ def get_replied_keys(since: datetime = None) -> set:
     with _cache_lock:
         keys = set()
         for nid, r in _cache_interviews.items():
+            for msg_id in r.get("uncertain_msg_ids") or []:
+                keys.add((str(nid), str(msg_id)))
             if not r.get("llm_sent"):
                 continue
             if since_str and r.get("last_seen", "") < since_str:
@@ -413,13 +441,13 @@ def load_browser_sessions() -> list:
     return []
 
 
-_save_sessions_lock = threading.Lock()
+_save_sessions_lock = threading.RLock()
 
 
 def _strip_sensitive_session_fields(s: dict) -> dict:
     """Удалить raw cookie line из сохранённого snapshot — иначе он лежит в
     browser_sessions.json в открытом виде (kimi-search-3 #8)."""
-    out = {k: v for k, v in s.items() if k not in ("_raw_cookie_line", "raw_cookie_line")}
+    out = {k: v for k, v in s.items() if not k.startswith("_") and k != "raw_cookie_line"}
     return out
 
 
@@ -429,7 +457,7 @@ _sessions_written_seq: int = 0        # последний seq, который �
 _sessions_pending_lock = threading.Lock()
 
 
-def save_browser_sessions(sessions: list, *, wait: bool = False):
+def save_browser_sessions(sessions: list, *, wait: bool = False, edit=None):
     """Сохранить браузерные сессии; ``wait`` нужен для transactional flows.
 
     Аудит round-1 #3: два worker'а в executor могли писать snapshot'ы в
@@ -440,8 +468,8 @@ def save_browser_sessions(sessions: list, *, wait: bool = False):
     """
     global _sessions_pending_snapshot, _sessions_pending_seq
     target_file = SESSIONS_FILE
-    snapshot = [_strip_sensitive_session_fields(copy.deepcopy(s)) for s in sessions]
-    with _sessions_pending_lock:
+    with _save_sessions_lock, _sessions_pending_lock:
+        snapshot = [copy.deepcopy(_strip_sensitive_session_fields({**s, **edit[1]} if edit and s is edit[0] else s)) for s in sessions]
         # Каждый новый вызов получает свежий seq. deepcopy сделан выше
         # (могли долго), но seq присваивается ЗДЕСЬ атомарно с обновлением
         # pending — конкурентный save с меньшим seq перезаписать не сможет.
@@ -475,6 +503,11 @@ def save_browser_sessions(sessions: list, *, wait: bool = False):
                             _sessions_pending_snapshot = pending
                             _sessions_pending_seq = pending_seq
                     if wait:
+                        # Failed UI edits are rolled back by the caller. Do not
+                        # leave their rejected snapshot queued for a later save.
+                        with _sessions_pending_lock:
+                            if _sessions_pending_seq == pending_seq:
+                                _sessions_pending_snapshot = None
                         raise
                     return
     if wait:
@@ -553,21 +586,34 @@ def add_applied(account_name: str, vacancy_id: str, info: dict = None, *, confir
 
 
 def add_test_vacancy(vacancy_id: str, title: str = "", company: str = "",
-                     account_name: str = "", resume_hash: str = ""):
+                     account_name: str = "", resume_hash: str = "", status: str = "pending"):
     global _tests_dirty, _tests_mut_seq
     _load_cache()
-    with _cache_lock:
-        if vacancy_id not in _cache_tests:
+    with _save_tests_lock, _cache_lock:
+        old = copy.deepcopy(_cache_tests.get(vacancy_id))
+        records = _test_records(old) if old else []
+        matching = next((r for r in records if r.get("account_name") == account_name and r.get("resume_hash", "") == resume_hash), None)
+        if matching is None or status == "review" or matching.get("status") == "retry":
             _tests_dirty = True
             _tests_mut_seq += 1
-            _cache_tests[vacancy_id] = {
+            record = {
                 "url": f"{hh_base()}/vacancy/{vacancy_id}",
                 "title": title,
                 "company": company,
                 "account_name": account_name,
                 "resume_hash": resume_hash,
-                "at": datetime.now().isoformat()
+                "at": datetime.now().astimezone().isoformat(),
+                "status": status,
             }
+            records = [r for r in records if r is not matching] + [record]
+            _cache_tests[vacancy_id] = {**record, "profile_records": records}
+            if status == "review":
+                try:
+                    # Persist the hold before any worker can observe/retry it.
+                    _atomic_write_json(TESTS_FILE, _cache_tests)
+                except Exception:
+                    # Fail closed in memory; the caller must stop on this error.
+                    raise
     _schedule_save(_save_tests_async)
 
 
@@ -578,10 +624,53 @@ def is_applied(account_name: str, vacancy_id: str) -> bool:
     return cached or application_exists(APPLIED_FILE, account_name, vacancy_id)
 
 
-def is_test(vacancy_id: str) -> bool:
+def _test_records(record):
+    return record.get("profile_records", [record])
+
+
+def is_test(vacancy_id: str, account_name: str = "", resume_hash: str = "") -> bool:
     _load_cache()
     with _cache_lock:
-        return vacancy_id in _cache_tests
+        record = _cache_tests.get(vacancy_id)
+        if not record:
+            return False
+        if not account_name:
+            return True
+        return any(r.get("status") != "retry" and (not r.get("account_name") or r.get("account_name") == account_name)
+                   and (not r.get("resume_hash") or r.get("resume_hash") == resume_hash) for r in _test_records(record))
+
+
+def is_review_pending(account_name: str, vacancy_id: str) -> bool:
+    _load_cache()
+    with _cache_lock:
+        record = (_cache_tests or {}).get(vacancy_id, {})
+        return any(r.get("status") == "review" and r.get("account_name") == account_name for r in _test_records(record))
+
+
+def resolve_review(vacancy_id, account_name, resume_hash, expected_at):
+    """Human-confirmed absence on HH allows retry; never erase dedup/history."""
+    global _tests_dirty, _tests_mut_seq
+    if not account_name or not resume_hash or not expected_at:
+        return False
+    _load_cache()
+    with _save_tests_lock, _cache_lock:
+        original = _cache_tests.get(vacancy_id)
+        if not original:
+            return False
+        records = copy.deepcopy(_test_records(original))
+        match = next((r for r in records if r.get("account_name") == account_name
+                      and r.get("resume_hash", "") == resume_hash and r.get("at") == expected_at
+                      and (r.get("status") == "review" or r.get("status") is None)), None)
+        if match is None:
+            return False
+        match.update(status="retry", resolved_at=datetime.now().astimezone().isoformat(), resolution="human_confirmed_not_sent")
+        candidate = {**original, "profile_records": records}
+        snapshot = {**_cache_tests, vacancy_id: candidate}
+        _atomic_write_json(TESTS_FILE, snapshot)
+        _cache_tests[vacancy_id] = candidate
+        _tests_mut_seq += 1
+        _tests_dirty = True
+    return True
 
 
 def get_stats() -> dict:
@@ -590,6 +679,24 @@ def get_stats() -> dict:
         by_acc = dict(db.execute("SELECT account_name,count(*) FROM applications GROUP BY account_name"))
         tests = db.execute("SELECT count(*) FROM test_vacancies").fetchone()[0]
         return {"total": sum(by_acc.values()), "tests": tests, "by_acc": by_acc}
+
+
+_dashboard_metrics_cache = (None, None)
+
+
+def get_dashboard_metrics():
+    from app.dashboard import application_metrics
+    global _dashboard_metrics_cache
+    _load_cache()
+    now = datetime.now().astimezone()
+    with _cache_lock:
+        key = (str(APPLIED_FILE), id(_cache_applied), _applied_mut_seq, int(now.timestamp() // 10))
+        if _dashboard_metrics_cache[0] == key:
+            return _dashboard_metrics_cache[1]
+        records = {name: dict(items) for name, items in (_cache_applied or {}).items()}
+    metrics = application_metrics(records, now)
+    _dashboard_metrics_cache = (key, metrics)
+    return metrics
 
 
 def get_applied_list(limit: int = 300) -> list:
@@ -608,6 +715,11 @@ def get_applied_list(limit: int = 300) -> list:
                 "salary_to": info.get("salary_to"),
                 "at": info.get("at", "")
             })
+    all_items.sort(key=lambda x: x.get("at", ""), reverse=True)
+    from app.dashboard import timestamp
+    for item in all_items:
+        stamp = timestamp(item["at"])
+        item["at"] = stamp.isoformat() if stamp else ""
     all_items.sort(key=lambda x: x.get("at", ""), reverse=True)
     return all_items[:limit]
 
@@ -682,7 +794,8 @@ def get_test_list(limit: int = 300) -> list:
         for vid in vacancies:
             applied_by.setdefault(vid, []).append(acc_name)
     items = []
-    for vid, info in tests.items():
+    for vid, record in tests.items():
+      for info in _test_records(record):
         items.append({
             "vacancy_id": vid,
             "url": info.get("url", f"{hh_base()}/vacancy/{vid}"),
@@ -691,6 +804,9 @@ def get_test_list(limit: int = 300) -> list:
             "account_name": info.get("account_name", ""),
             "resume_hash": info.get("resume_hash", ""),
             "applied_by": applied_by.get(vid, []),
+            "status": ("sent" if info.get("account_name") in applied_by.get(vid, [])
+                       else "review" if info.get("status") == "review"
+                       else info["status"] if info.get("status") in ("pending", "retry") else "unknown"),
             "at": info.get("at", "")
         })
     items.sort(key=lambda x: x.get("at", ""), reverse=True)

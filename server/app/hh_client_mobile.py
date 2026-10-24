@@ -240,10 +240,14 @@ class MobileHHClient(HHClient):
         if letter_max_length and len(letter) > letter_max_length:
             letter = letter[:letter_max_length].rstrip()
         visibility_id = self.acc.get("required_applicant_visibility_id", "")
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: mobile_apply.submit_response(
-                self.acc, vid, self.acc.get("resume_hash", ""), letter,
-                required_applicant_visibility_id=visibility_id))
+        from app.dispatch import DispatchCancelled
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: mobile_apply.submit_response(
+                    self.acc, vid, self.acc.get("resume_hash", ""), letter,
+                    required_applicant_visibility_id=visibility_id))
+        except DispatchCancelled:
+            return "cancelled", {}
         if result.get("ok"):
             return "sent", {"negotiation_id": result.get("negotiation_id", "")}
         info = {"error_type": result.get("error_type", ""),

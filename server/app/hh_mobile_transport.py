@@ -87,6 +87,10 @@ def mobile_request(acc: dict, method: str, path: str, *, params=None,
     token = oauth._obtain_oauth_token(acc)
     if not token:
         raise MobileAPIError(401, payload="no_oauth_token", url=url)
+    if method.upper() == "POST" and path.rstrip("/").endswith("/negotiations"):
+        from app.dispatch import dispatch_allowed, DispatchCancelled
+        if not dispatch_allowed(acc):
+            raise DispatchCancelled()
     try:
         r = requests.request(
             method, url, params=params, json=json_body, data=form,

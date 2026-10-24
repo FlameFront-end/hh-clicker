@@ -7,6 +7,7 @@ import json
 import time
 import requests
 import aiohttp
+from app.dispatch import dispatch_allowed
 
 from glom import glom
 
@@ -76,8 +77,12 @@ def classify_apply_response(status_code: int, txt: str) -> tuple:
     4. 200 + success-маркер → sent
     5. всё остальное → error
     """
+    txt = txt.strip()
     if status_code in (401, 403):
         return "auth_error", {}
+
+    if status_code >= 500:
+        return "error", {"raw": txt[:200], "transient": True}
 
     if status_code == 200 and _is_login_page(txt):
         return "auth_error", {}
@@ -143,13 +148,18 @@ def classify_apply_response(status_code: int, txt: str) -> tuple:
 
         # Теперь успех: новый формат top-level success/topic_id
         top_success = parsed.get("success")
-        if top_success in (True, "true", "True") or parsed.get("topic_id"):
+        if status_code == 200 and (top_success in (True, "true", "True")
+                                   or parsed.get("topic_id") or parsed.get("status") == "ok"):
             info["topic_id"] = parsed.get("topic_id", "")
             info["chat_id"] = parsed.get("chat_id", "")
             return "sent", info
-        if rs.get("responded") is True or rs.get("success") is True:
+        if status_code == 200 and (rs.get("responded") is True or rs.get("success") is True):
             return "sent", info
-        # JSON распарсен но никаких флагов — fallthrough к substring fallback.
+        # Legacy HH popup returns responseStatus.shortVacancy on acceptance.
+        # Validate its structure, not an arbitrary occurrence of the field name.
+        vacancy = rs.get("shortVacancy")
+        if status_code == 200 and isinstance(vacancy, dict) and vacancy.get("name"):
+            return "sent", info
 
     # ── 3. Substring fallback для не-JSON ответов (HTML страница и т.п.) ──
     if "negotiations-limit-exceeded" in txt:
@@ -160,18 +170,7 @@ def classify_apply_response(status_code: int, txt: str) -> tuple:
         return "already", info
 
     if status_code == 200:
-        if ('"success":true' in txt or '"success":"true"' in txt
-                or '"status":"ok"' in txt or '"responded":true' in txt
-                or "shortVacancy" in txt or "topic_id" in txt):
-            return "sent", info
-        # HH иногда отдаёт 200 + HTML SPA-страницу редиректа (например на
-        # /vacancy/{id} после успешного отклика) без JSON-маркеров. Если
-        # тело большое (>2KB HTML) и НЕ содержит явных ошибок — trust'им,
-        # 200 от popup submit без 4xx-error = отклик прошёл.
-        if len(txt) > 2000 and ("<!doctype" in txt[:200].lower() or "<html" in txt[:200].lower()):
-            if not any(m in txt for m in ('"error"', 'test-required', 'already-applied',
-                                          'negotiations-limit', 'SPAM_DETECTED', 'captcha')):
-                return "sent", info
+        # SPA/HTML, a large body, or a field name in JS is not a receipt.
         return "error", {"raw": txt[:200], **info}
 
     if status_code in (502, 503, 504):
@@ -278,11 +277,15 @@ async def send_response_async(acc: dict, vid: str, letter_max_length: int | None
     data.add_field("lux", "true")
     data.add_field("ignore_postponed", "true")
 
+    post_started = False
     try:
         # Egress через HH_PROXY: socks → ProxyConnector на сессию,
         # http(s) → proxy= на запрос (см. _aio_egress_kwargs).
         sess_kw, req_kw = _aio_egress_kwargs()
         async with aiohttp.ClientSession(headers=headers, cookies=acc["cookies"], **sess_kw) as session:
+            if not dispatch_allowed(acc):
+                return "cancelled", {}
+            post_started = True
             async with session.post(
                 hh_base() + "/applicant/vacancy_response/popup",
                 data=data,
@@ -298,9 +301,12 @@ async def send_response_async(acc: dict, vid: str, letter_max_length: int | None
         elif status_code == 200 and 500 < len(txt) < 30000 and '"topic_id"' not in txt and '"success"' not in txt:
             # Диагностика: HTML-редирект после отклика — что там?
             log_debug(f"   200 (не-JSON, {len(txt)}b): {txt[:200]}")
-        return classify_apply_response(status_code, txt)
+        result, info = classify_apply_response(status_code, txt)
+        if result == "error" and (status_code == 200 or status_code >= 500):
+            info = {**info, "review_required": True}
+        return result, info
     except Exception as e:
-        return "error", {"exception": str(e)}
+        return "error", {"exception": str(e), "review_required": post_started}
 
 
 async def fill_and_submit_questionnaire(acc: dict, vid: str,
@@ -454,6 +460,8 @@ async def fill_and_submit_questionnaire(acc: dict, vid: str,
                     data.add_field(name, str(value))
 
             # Шаг 3: POST
+            if not dispatch_allowed(acc):
+                return "cancelled", {}
             async with session.post(
                 url_form,
                 headers={"X-Xsrftoken": acc.get("cookies", {}).get("_xsrf", ""), "Referer": url_form},

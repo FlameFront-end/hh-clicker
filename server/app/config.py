@@ -33,6 +33,7 @@ CONFIG.default_client_mode (дефолт "web").
 """
 
 import json
+import copy
 import threading
 from pathlib import Path
 from app.database import read_document, write_document, document_exists, update_document
@@ -148,8 +149,10 @@ def resume_filter_value(account: dict, resume_hash: str, key: str):
     return getattr(CONFIG, key, [])
 
 # Защищаем write+rename последовательность от конкурентных вызовов из разных потоков.
-_config_write_lock = threading.Lock()
-_accounts_write_lock = threading.Lock()
+_config_write_lock = threading.RLock()
+_config_save_seq = 0
+_accounts_write_lock = threading.RLock()
+_accounts_save_seq = 0
 
 
 # ============================================================
@@ -184,6 +187,7 @@ class Config:
     # WebSocket realtime updates от chatik.hh.ru (Phase 1). Off by default —
     # legacy polling loop продолжает работать. Включать per-account через /api/ws/{idx}/enable.
     use_websocket_realtime: bool = False
+    bot_paused: bool = False  # Общая пауза (кнопка «Пауза» в шапке), сохраняется между запусками
     daily_apply_limit: int = 0  # Жёсткий лимит откликов в день (0 = без ограничения)
     stop_on_hh_limit: bool = True  # Полная остановка при HH лимите (не перепроверять)
     # Фильтр по формату работы (пустой = без фильтра, все форматы)
@@ -362,6 +366,11 @@ _CONFIG_KEYS = [
     "hh_region", "llm_applicant_gender", "llm_auto_send", "llm_enabled",
     "llm_ws_push_enabled", "use_websocket_realtime", "chat_use_oauth", "llm_use_quick_replies",
     "hh_ai_letter_first_try", "related_vacancies_enabled", "hh_proxy_url",
+    # Раньше эти два флага не принимались через set_config — переключатели
+    # «Учитывать резюме / письмо» в UI молча ничего не меняли.
+    "llm_use_cover_letter", "llm_use_resume",
+    # Общая пауза бота переживает перезапуск контейнера.
+    "bot_paused",
 ]
 
 
@@ -451,15 +460,25 @@ def config_snapshot() -> dict:
     return data
 
 
-def save_config():
+def save_config(*, wait=False, updates=None):
     """Сохранить текущий CONFIG на диск."""
-    global _url_pages_map_cache, _url_pool_version
-    data = config_snapshot()
+    global _url_pages_map_cache, _url_pool_version, _config_save_seq
+    if updates and not wait:
+        raise ValueError("Staged config updates require wait=True")
+    with _config_write_lock:
+        data = copy.deepcopy(config_snapshot())
+        if updates:
+            data.update(copy.deepcopy(updates))
+        else:
+            _url_pool_version += 1
+            _url_pages_map_cache = None
+        _config_save_seq += 1
+        seq = _config_save_seq
     target_file = CONFIG_FILE
-    _url_pool_version += 1
-    _url_pages_map_cache = None
     def _write():
         with _config_write_lock:
+            if seq != _config_save_seq:
+                return False
             try:
                 def merge(current):
                     result = dict(current or {})
@@ -468,9 +487,23 @@ def save_config():
                         result["mobile_auth"] = current["mobile_auth"]
                     return result
                 update_document(target_file, merge, {})
+                return True
             except Exception as e:
                 log_debug(f"save_config error: {e}")
-    (_schedule_save(_write) if _schedule_save else threading.Thread(target=_write, daemon=True).start())
+                if wait:
+                    raise
+    if wait:
+        with _config_write_lock:
+            saved = _write()
+            if updates:
+                if saved is not True:
+                    raise RuntimeError("Config changed before staged update committed")
+                for key, value in updates.items():
+                    setattr(CONFIG, key, copy.deepcopy(value))
+                _url_pool_version += 1
+                _url_pages_map_cache = None
+    else:
+        (_schedule_save(_write) if _schedule_save else threading.Thread(target=_write, daemon=True).start())
 
 
 def load_config():
@@ -554,20 +587,31 @@ def load_config():
         log_debug(f"load_config error: {e}")
 
 
-def save_accounts():
-    """Сохранить accounts_data на диск (в фоновом потоке)."""
-    snapshot = [
-        {k: v for k, v in acc.items() if not k.startswith("_")}
-        for acc in accounts_data
-    ]
+def save_accounts(*, wait=False, edit=None):
+    """Serialize snapshots; a queued older save must never undo a committed edit."""
+    global _accounts_save_seq
+    with _accounts_write_lock:
+        snapshot = copy.deepcopy([
+            {k: v for k, v in ({**acc, **edit[1]} if edit and acc is edit[0] else acc).items() if not k.startswith("_")}
+            for acc in accounts_data
+        ])
+        _accounts_save_seq += 1
+        seq = _accounts_save_seq
     target_file = ACCOUNTS_FILE
     def _write():
         with _accounts_write_lock:
+            if seq != _accounts_save_seq:
+                return
             try:
                 write_document(target_file, snapshot)
             except Exception as e:
                 log_debug(f"save_accounts error: {e}")
-    (_schedule_save(_write) if _schedule_save else threading.Thread(target=_write, daemon=True).start())
+                if wait:
+                    raise
+    if wait:
+        _write()
+    else:
+        (_schedule_save(_write) if _schedule_save else threading.Thread(target=_write, daemon=True).start())
 
 
 def load_accounts():

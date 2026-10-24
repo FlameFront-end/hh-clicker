@@ -174,7 +174,7 @@ _LLM_RUN_NOW_COOLDOWN = 60  # сек — минимум между принуд�
 
 
 @router.post("/api/llm_run_now")
-async def api_llm_run_now():
+async def api_llm_run_now(account_idx: int | None = None):
     """Принудительно запустить LLM авто-ответы для всех аккаунтов прямо сейчас (в фоне).
 
     Rate-limit: cooldown между запусками + одновременно может идти только один _run,
@@ -182,6 +182,15 @@ async def api_llm_run_now():
     """
     global _llm_run_now_last
     import time as _time
+    if account_idx is not None:
+        selected = bot._get_apply_state(account_idx)
+        if selected is None:
+            return {"started": False, "error": "Активный профиль не найден"}
+        if not bot._llm_processing_allowed(selected):
+            return {"started": False, "error": "Профиль или ИИ на паузе — сначала включите их"}
+        states_to_run = [selected]
+    else:
+        states_to_run = list(bot.account_states) + list(bot.temp_states.values())
     # Pre-flight: проверки конфига ДО загрузки чат-листов с HH (raw_config-уровень).
     # Если LLM глобально выключен или нет ни одного рабочего профиля — впустую
     # тащить список чатов и потом вылетать в цикле нет смысла.
@@ -205,8 +214,7 @@ async def api_llm_run_now():
 
     def _run():
         try:
-            states = list(bot.account_states) + list(bot.temp_states.values())
-            for state in states:
+            for state in states_to_run:
                 try:
                     bot._process_llm_replies(state)
                 except Exception as e:
@@ -214,7 +222,7 @@ async def api_llm_run_now():
         finally:
             _llm_run_now_lock.release()
     threading.Thread(target=_run, daemon=True).start()
-    return {"started": True, "accounts": len(bot.account_states) + len(bot.temp_states)}
+    return {"started": True, "accounts": len(states_to_run)}
 
 
 @router.post("/api/llm_reset_replied")
